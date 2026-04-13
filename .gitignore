@@ -121,3 +121,16 @@ venv.bak/
 
 # private macros
 macros_private.py
+
+# vscode settings
+.vscode/
+
+# datasets
+datasets/
+
+# AGENT SKILLS
+AGENTS.md
+skills/
+
+# paper configs (too many)
+robomimic/exps/paper/
