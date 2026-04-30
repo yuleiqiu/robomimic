@@ -134,3 +134,6 @@ skills/
 
 # paper configs (too many)
 robomimic/exps/paper/
+
+# run folder
+runs/
