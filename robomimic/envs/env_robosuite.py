@@ -32,6 +32,7 @@ except ImportError:
 
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.lang_utils as LangUtils
+import robomimic.utils.target_mask_utils as TargetMaskUtils
 import robomimic.envs.env_base as EB
 
 # protect against missing mujoco-py module, since robosuite might be using mujoco-py or DM backend
@@ -82,6 +83,7 @@ class EnvRobosuite(EB.EnvBase):
             assert (int(robosuite.__version__.split(".")[1]) >= 2), "only support robosuite v0.3 and v1.2+"
 
         kwargs = deepcopy(kwargs)
+        self.target_mask_image_config = kwargs.pop("target_mask_image", None)
 
         # update kwargs based on passed arguments
         update_kwargs = dict(
@@ -284,6 +286,11 @@ class EnvRobosuite(EB.EnvBase):
 
         if self._lang_emb is not None:
             ret[LangUtils.LANG_EMB_OBS_KEY] = np.array(self._lang_emb)
+        ret = TargetMaskUtils.apply_target_mask_images_to_obs(
+            raw_env=self.env,
+            obs=ret,
+            mask_config=self.target_mask_image_config,
+        )
         return ret
 
     def get_real_depth_map(self, depth_map):
