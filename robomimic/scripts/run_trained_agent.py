@@ -70,7 +70,50 @@ from robomimic.envs.wrappers import EnvWrapper
 from robomimic.algo import RolloutPolicy
 
 
-def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5, return_obs=False, camera_names=None):
+def resize_nearest(image, height, width):
+    """
+    Resize an HWC image with nearest-neighbor sampling.
+    """
+    y_idx = np.linspace(0, image.shape[0] - 1, height).astype(np.int64)
+    x_idx = np.linspace(0, image.shape[1] - 1, width).astype(np.int64)
+    return image[y_idx][:, x_idx]
+
+
+def make_target_mask_grid_video_frame(env, obs, camera_names, height=512, width=512):
+    """
+    Builds a 2-column video frame for each camera: original RGB render on the
+    left, policy observation image on the right. Rows correspond to cameras.
+    """
+    rows = []
+    for cam_name in camera_names:
+        rgb = env.render(mode="rgb_array", height=height, width=width, camera_name=cam_name)
+        obs_key = "{}_image".format(cam_name)
+        if obs_key not in obs:
+            raise KeyError("Observation key '{}' not found for target-mask video".format(obs_key))
+        mask = obs[obs_key]
+        if mask.ndim == 4:
+            mask = mask[-1]
+        if mask.shape[:2] != (height, width):
+            mask = resize_nearest(mask, height=height, width=width)
+        if mask.ndim == 2:
+            mask = mask[..., None]
+        if mask.shape[-1] == 1:
+            mask = np.repeat(mask, 3, axis=-1)
+        rows.append(np.concatenate([rgb, mask.astype(np.uint8)], axis=1))
+    return np.concatenate(rows, axis=0)
+
+
+def rollout(
+    policy,
+    env,
+    horizon,
+    render=False,
+    video_writer=None,
+    video_skip=5,
+    return_obs=False,
+    camera_names=None,
+    video_target_mask_grid=False,
+):
     """
     Helper function to carry out rollouts. Supports on-screen rendering, off-screen rendering to a video, 
     and returns the rollout trajectory.
@@ -128,10 +171,19 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
                 env.render(mode="human", camera_name=camera_names[0])
             if video_writer is not None:
                 if video_count % video_skip == 0:
-                    video_img = []
-                    for cam_name in camera_names:
-                        video_img.append(env.render(mode="rgb_array", height=512, width=512, camera_name=cam_name))
-                    video_img = np.concatenate(video_img, axis=1) # concatenate horizontally
+                    if video_target_mask_grid:
+                        video_img = make_target_mask_grid_video_frame(
+                            env=env,
+                            obs=next_obs,
+                            camera_names=camera_names,
+                            height=512,
+                            width=512,
+                        )
+                    else:
+                        video_img = []
+                        for cam_name in camera_names:
+                            video_img.append(env.render(mode="rgb_array", height=512, width=512, camera_name=cam_name))
+                        video_img = np.concatenate(video_img, axis=1) # concatenate horizontally
                     video_writer.append_data(video_img)
                 video_count += 1
 
@@ -182,6 +234,8 @@ def run_trained_agent(args):
     if args.render:
         # on-screen rendering can only support one camera
         assert len(args.camera_names) == 1
+    if args.video_target_mask_grid and args.camera_names == ["agentview"]:
+        args.camera_names = ["agentview", "robot0_eye_in_hand"]
 
     # relative path to agent
     ckpt_path = args.agent
@@ -237,6 +291,7 @@ def run_trained_agent(args):
             video_skip=args.video_skip, 
             return_obs=(write_dataset and args.dataset_obs),
             camera_names=args.camera_names,
+            video_target_mask_grid=args.video_target_mask_grid,
         )
         rollout_stats.append(stats)
 
@@ -343,6 +398,12 @@ if __name__ == "__main__":
         help="(optional) camera name(s) to use for rendering on-screen or to video",
     )
 
+    parser.add_argument(
+        "--video_target_mask_grid",
+        action="store_true",
+        help="render a 2-column video per camera: original RGB on the left and policy image observation on the right",
+    )
+
     # If provided, an hdf5 file will be written with the rollout data
     parser.add_argument(
         "--dataset_path",
@@ -369,4 +430,3 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     run_trained_agent(args)
-
