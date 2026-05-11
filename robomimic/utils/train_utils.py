@@ -160,6 +160,8 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
     if dataset_path is None:
         dataset_path = config.train.data
 
+    obs_keys = list(obs_keys)
+
     # NOTE: currently supporting fixed language embedding per dataset
     ## that is fetched from dataset config and not from file
     if LangUtils.LANG_EMB_OBS_KEY in obs_keys:
