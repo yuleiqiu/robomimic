@@ -53,6 +53,7 @@ Example usage:
 """
 import argparse
 import json
+import os
 import h5py
 import imageio
 import numpy as np
@@ -217,6 +218,9 @@ def run_trained_agent(args):
     # maybe create video writer
     video_writer = None
     if write_video:
+        video_dir = os.path.dirname(args.video_path)
+        if video_dir:
+            os.makedirs(video_dir, exist_ok=True)
         video_writer = imageio.get_writer(args.video_path, fps=20)
 
     # maybe open hdf5 to write rollouts
@@ -263,6 +267,11 @@ def run_trained_agent(args):
     avg_rollout_stats["Num_Success"] = np.sum(rollout_stats["Success_Rate"])
     print("Average Rollout Stats")
     print(json.dumps(avg_rollout_stats, indent=4))
+    if write_video:
+        result_path = os.path.splitext(args.video_path)[0] + ".json"
+        with open(result_path, "w") as f:
+            json.dump(avg_rollout_stats, f, indent=4)
+        print("Wrote rollout stats to {}".format(result_path))
 
     if write_video:
         video_writer.close()
@@ -369,4 +378,3 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     run_trained_agent(args)
-
