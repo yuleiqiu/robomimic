@@ -134,3 +134,5 @@ skills/
 
 # paper configs (too many)
 robomimic/exps/paper/
+
+runs/
