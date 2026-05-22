@@ -223,6 +223,22 @@ def maybe_dict_from_checkpoint(ckpt_path=None, ckpt_dict=None):
     return ckpt_dict
 
 
+def _select_checkpoint_metadata(metadata, metadata_key):
+    """
+    Select metadata from checkpoint fields that may be saved as a single dict
+    or as a list of per-dataset metadata dictionaries.
+    """
+    if isinstance(metadata, list):
+        if len(metadata) == 0:
+            raise ValueError(
+                "Checkpoint metadata '{}' is an empty list; cannot select metadata for loading.".format(
+                    metadata_key
+                )
+            )
+        return metadata[0]
+    return metadata
+
+
 def algo_name_from_checkpoint(ckpt_path=None, ckpt_dict=None):
     """
     Return algorithm name that was used to train a checkpoint or
@@ -402,7 +418,7 @@ def policy_from_checkpoint(device=None, ckpt_path=None, ckpt_dict=None, verbose=
     ObsUtils.initialize_obs_utils_with_config(config)
 
     # shape meta from model dict to get info needed to create model
-    shape_meta = ckpt_dict["shape_metadata"]
+    shape_meta = _select_checkpoint_metadata(ckpt_dict["shape_metadata"], "shape_metadata")
 
     # maybe restore observation normalization stats
     obs_normalization_stats = ckpt_dict.get("obs_normalization_stats", None)
@@ -469,8 +485,8 @@ def env_from_checkpoint(ckpt_path=None, ckpt_dict=None, env_name=None, render=Fa
     ckpt_dict = maybe_dict_from_checkpoint(ckpt_path=ckpt_path, ckpt_dict=ckpt_dict)
 
     # metadata from model dict to get info needed to create environment
-    env_meta = ckpt_dict["env_metadata"]
-    shape_meta = ckpt_dict["shape_metadata"]
+    env_meta = _select_checkpoint_metadata(ckpt_dict["env_metadata"], "env_metadata")
+    shape_meta = _select_checkpoint_metadata(ckpt_dict["shape_metadata"], "shape_metadata")
 
     # create env from saved metadata
     env = EnvUtils.create_env_from_metadata(
