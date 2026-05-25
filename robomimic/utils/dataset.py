@@ -19,6 +19,95 @@ import robomimic.utils.log_utils as LogUtils
 import robomimic.utils.lang_utils as LangUtils
 
 
+def _config_get(config, key, default=None):
+    """
+    Read from a dict-like config without creating missing Config keys.
+    """
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(key, default)
+    if key in config:
+        return config[key]
+    return default
+
+
+def _decode_attr_value(value):
+    """
+    Normalize common hdf5 attribute scalar types.
+    """
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def weighted_loss_enabled(weighted_loss_config):
+    """
+    Return whether outcome weighting is enabled for a weighted loss config.
+    """
+    return bool(_config_get(weighted_loss_config, "enabled", False))
+
+
+def _demo_attrs_to_dict(ep_grp):
+    """
+    Copy hdf5 demo attrs into a plain dictionary.
+    """
+    return {k: _decode_attr_value(v) for k, v in ep_grp.attrs.items()}
+
+
+def compute_sequence_sample_weight(
+    demo_attrs,
+    index_in_demo,
+    seq_length,
+    weighted_loss_config,
+    dataset_source=None,
+    dataset_path=None,
+    demo_id=None,
+):
+    """
+    Compute the scalar training weight for one sampled sequence.
+    """
+    source = demo_attrs.get("source", dataset_source)
+    source = _decode_attr_value(source) if source is not None else "single"
+
+    context = ""
+    if dataset_path is not None or demo_id is not None:
+        context = " for dataset '{}' demo '{}'".format(dataset_path, demo_id)
+
+    if source not in ("single", "rollout"):
+        raise ValueError(
+            "Unexpected demo source '{}'{}; expected 'single' or 'rollout'.".format(
+                source, context
+            )
+        )
+
+    if source == "single":
+        return float(_config_get(weighted_loss_config, "human_demo_weight", 1.0))
+
+    if "success" not in demo_attrs:
+        raise ValueError(
+            "Rollout demo{} is missing attrs['success']; run annotate_dataset_success.py first.".format(
+                context
+            )
+        )
+
+    success = bool(int(_decode_attr_value(demo_attrs["success"])))
+    if success:
+        return float(_config_get(weighted_loss_config, "success_rollout_weight", 1.0))
+
+    if "failure_step" not in demo_attrs:
+        return float(_config_get(weighted_loss_config, "failed_rollout_weight", 0.1))
+
+    failure_step = int(_decode_attr_value(demo_attrs["failure_step"]))
+    failure_window = int(_config_get(weighted_loss_config, "failure_window", 10))
+    chunk_end = int(index_in_demo) + int(seq_length) - 1
+    if chunk_end < (failure_step - failure_window):
+        return float(_config_get(weighted_loss_config, "prefailure_weight", 0.3))
+    return float(_config_get(weighted_loss_config, "postfailure_weight", 0.0))
+
+
 class SequenceDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -40,6 +129,8 @@ class SequenceDataset(torch.utils.data.Dataset):
         load_next_obs=True,
         lang=None,
         demo_limit=None,
+        weighted_loss_config=None,
+        dataset_source=None,
     ):
         """
         Dataset class for fetching sequences of experience.
@@ -93,6 +184,10 @@ class SequenceDataset(torch.utils.data.Dataset):
             lang: language instruction for this dataset
 
             demo_limit (int): if provided, limit the number of demonstrations to load from the dataset.
+
+            weighted_loss_config (dict or Config): optional config for computing per-sequence sample weights.
+
+            dataset_source (str): optional dataset-level source fallback ("single" or "rollout").
         """
         super(SequenceDataset, self).__init__()
 
@@ -106,6 +201,9 @@ class SequenceDataset(torch.utils.data.Dataset):
 
         self.load_next_obs = load_next_obs
         self.filter_by_attribute = filter_by_attribute
+        self.weighted_loss_config = weighted_loss_config
+        self.weighted_loss_enabled = weighted_loss_enabled(weighted_loss_config)
+        self.dataset_source = dataset_source
 
         # set up lang and language embedding
         self.lang = lang
@@ -214,13 +312,17 @@ class SequenceDataset(torch.utils.data.Dataset):
         self._index_to_demo_id = dict()  # maps every index to a demo id
         self._demo_id_to_start_indices = dict()  # gives start index per demo id
         self._demo_id_to_demo_length = dict()
+        self._demo_id_to_outcome_attrs = dict()
 
         # determine index mapping
         self.total_num_sequences = 0
         for ep in self.demos:
-            demo_length = self.hdf5_file["data/{}".format(ep)].attrs["num_samples"]
+            ep_grp = self.hdf5_file["data/{}".format(ep)]
+            demo_length = ep_grp.attrs["num_samples"]
             self._demo_id_to_start_indices[ep] = self.total_num_sequences
             self._demo_id_to_demo_length[ep] = demo_length
+            if self.weighted_loss_enabled:
+                self._demo_id_to_outcome_attrs[ep] = _demo_attrs_to_dict(ep_grp)
 
             num_sequences = demo_length
             # determine actual number of sequences taking into account whether to pad for frame_stack and seq_length
@@ -525,6 +627,20 @@ class SequenceDataset(torch.utils.data.Dataset):
 
         # also return the sampled index
         meta["index"] = index
+
+        if self.weighted_loss_enabled:
+            meta["sample_weight"] = np.array(
+                compute_sequence_sample_weight(
+                    demo_attrs=self._demo_id_to_outcome_attrs[demo_id],
+                    index_in_demo=index_in_demo,
+                    seq_length=self.seq_length,
+                    weighted_loss_config=self.weighted_loss_config,
+                    dataset_source=self.dataset_source,
+                    dataset_path=self.hdf5_path,
+                    demo_id=demo_id,
+                ),
+                dtype=np.float32,
+            )
 
         # language embedding
         if self._lang_emb is not None:

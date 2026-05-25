@@ -159,6 +159,7 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
     """
     if dataset_path is None:
         dataset_path = config.train.data
+    weighted_loss_config = config.train["weighted_loss"] if "weighted_loss" in config.train else None
 
     # NOTE: currently supporting fixed language embedding per dataset
     ## that is fetched from dataset config and not from file
@@ -185,11 +186,13 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
         hdf5_use_swmr=config.train.hdf5_use_swmr,
         hdf5_normalize_obs=config.train.hdf5_normalize_obs,
         filter_by_attribute=filter_by_attribute,
+        weighted_loss_config=weighted_loss_config,
     )
 
     ds_kwargs["hdf5_path"] = [ds_cfg["path"] for ds_cfg in config.train.data]
     ds_kwargs["filter_by_attribute"] = [ds_cfg.get("filter_key", filter_by_attribute) for ds_cfg in config.train.data]
     ds_kwargs["demo_limit"] = [ds_cfg.get("demo_limit", None) for ds_cfg in config.train.data]
+    ds_kwargs["dataset_source"] = [ds_cfg.get("source", None) for ds_cfg in config.train.data]
     ds_weights = [ds_cfg.get("weight", 1.0) for ds_cfg in config.train.data]
 
     meta_ds_kwargs = dict()
@@ -236,7 +239,7 @@ def get_dataset(
         
         ds_kwargs_copy = deepcopy(ds_kwargs)
 
-        keys = ["hdf5_path", "filter_by_attribute", "demo_limit"]
+        keys = ["hdf5_path", "filter_by_attribute", "demo_limit", "dataset_source"]
 
         for k in keys:
             ds_kwargs_copy[k] = ds_kwargs[k][i]

@@ -251,6 +251,7 @@ def annotate_dataset_success(args):
             if not args.dry_run:
                 ep_grp.attrs[args.success_attr] = int(result["success"])
                 ep_grp.attrs[args.success_timestep_attr] = int(result["success_timestep"])
+                ep_grp.attrs[args.source_attr] = args.source_value
                 ep_grp.attrs["success_metrics"] = json.dumps(result["success_metrics"], indent=4)
                 ep_grp.attrs["success_annotation_method"] = result["annotation_method"]
                 if "max_state_divergence" in result:
@@ -331,6 +332,18 @@ if __name__ == "__main__":
         type=str,
         default="success_timestep",
         help="per-demo hdf5 attribute name for first success timestep, or -1 for failure",
+    )
+    parser.add_argument(
+        "--source_attr",
+        type=str,
+        default="source",
+        help="per-demo hdf5 attribute name for dataset source",
+    )
+    parser.add_argument(
+        "--source_value",
+        type=str,
+        default="rollout",
+        help="source value to write for annotated demos",
     )
     parser.add_argument(
         "--write_filter_keys",
