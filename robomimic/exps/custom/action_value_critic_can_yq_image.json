@@ -1,0 +1,46 @@
+{
+    "experiment": {
+        "name": "action_value_critic_can_yq_image",
+        "output_dir": "runs/trained_models/action_value_critic_can_yq_image",
+        "logging": {
+            "terminal_output_to_txt": true,
+            "log_tb": true,
+            "log_wandb": true,
+            "wandb_proj_name": "action_value_critic"
+        },
+        "save": {
+            "enabled": true,
+            "every_n_epochs": 20
+        }
+    },
+    "train": {
+        "rollout_dataset_paths": [
+            "datasets/breadcan/yq_rollout/rollouts_image_success.hdf5",
+            "datasets/breadcan/yq_rollout/rollouts_image_failure.hdf5"
+        ],
+        "base_policy_ckpt": "robomimic/runs/trained_models/diffusion_policy_can_yq_image/20260410140239/models/model_epoch_480_image_v15_success_1.0.pth",
+        "action_horizon": 8,
+        "obs_keys": null,
+        "batch_size": 64,
+        "num_epochs": 100,
+        "learning_rate": 1e-4,
+        "weight_decay": 1e-6,
+        "hidden_dim": 256,
+        "train_filter_key": "train",
+        "val_filter_key": "valid",
+        "freeze_obs_encoder": true,
+        "num_data_workers": 0,
+        "seed": 500,
+        "cuda": true
+    },
+    "rollout": {
+        "policy_ckpt": "robomimic/runs/trained_models/diffusion_policy_can_yq_image/20260410140239/models/model_epoch_480_image_v15_success_1.0.pth",
+        "critic_ckpt": "runs/trained_models/action_value_critic_can_yq_image/critic_best.pth",
+        "n_rollouts": 50,
+        "horizon": 400,
+        "num_candidates": 8,
+        "dataset_path": "datasets/breadcan/yq_rollout/critic_rerank_rollouts.hdf5",
+        "dataset_obs": true,
+        "seed": 500
+    }
+}

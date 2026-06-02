@@ -12,3 +12,4 @@ from robomimic.config.iris_config import IRISConfig
 from robomimic.config.td3_bc_config import TD3_BCConfig
 from robomimic.config.diffusion_policy_config import DiffusionPolicyConfig
 from robomimic.config.diffusion_policy_weighted_config import DiffusionPolicyWeightedConfig
+from robomimic.config.critic_config import CriticConfig
