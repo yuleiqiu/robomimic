@@ -19,6 +19,7 @@ import robomimic.models.diffusion_policy_nets as DPNets
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.obs_utils as ObsUtils
+import robomimic.utils.obstacle_guidance_utils as ObstacleGuidanceUtils
 
 from robomimic.algo import register_algo_factory_func, PolicyAlgo
 
@@ -119,6 +120,9 @@ class DiffusionPolicyUNet(PolicyAlgo):
         self.action_check_done = False
         self.obs_queue = None
         self.action_queue = None
+        self.obstacle_guidance_context = None
+        self.last_obstacle_guidance_info = None
+        self.obstacle_guidance_sample_count = 0
     
     def process_batch_for_training(self, batch):
         """
@@ -269,6 +273,97 @@ class DiffusionPolicyUNet(PolicyAlgo):
         action_queue = deque(maxlen=Ta)
         self.obs_queue = obs_queue
         self.action_queue = action_queue
+        self.last_obstacle_guidance_info = None
+        self.obstacle_guidance_sample_count = 0
+
+    def set_obstacle_guidance_context(self, context=None):
+        """
+        Set optional inference-time obstacle guidance context for the next action
+        trajectory sample. Passing None or an ``enabled=False`` context disables
+        guidance without changing the baseline sampler path.
+        """
+        self.obstacle_guidance_context = context
+
+    def _obstacle_guidance_enabled(self):
+        context = self.obstacle_guidance_context
+        if context is None:
+            return False
+        if not context.get("enabled", False):
+            return False
+        centers = context.get("obstacle_centers_xy", None)
+        radii = context.get("obstacle_radii", None)
+        if centers is None or radii is None:
+            return False
+        if len(centers) == 0 or len(radii) == 0:
+            return False
+        return context.get("guidance_scale", 0.0) > 0.0
+
+    def _guided_scheduler_step(
+        self,
+        nets,
+        naction,
+        timestep,
+        obs_cond,
+        step_index,
+        num_steps,
+    ):
+        """
+        Run one reverse diffusion step with optional obstacle cost guidance.
+        """
+        context = self.obstacle_guidance_context
+        naction_in = naction.detach().requires_grad_(True)
+
+        noise_pred = nets["policy"]["noise_pred_net"](
+            sample=naction_in,
+            timestep=timestep,
+            global_cond=obs_cond,
+        )
+        step_output = self.noise_scheduler.step(
+            model_output=noise_pred,
+            timestep=timestep,
+            sample=naction_in,
+        )
+        x0_hat = ObstacleGuidanceUtils.estimate_clean_action_from_scheduler(
+            scheduler=self.noise_scheduler,
+            sample=naction_in,
+            timestep=timestep,
+            model_output=noise_pred,
+            step_output=step_output,
+        )
+
+        guidance_horizon = context.get("guidance_horizon", self.algo_config.horizon.action_horizon)
+        cost, cost_stats = ObstacleGuidanceUtils.obstacle_xy_cost(
+            action_chunk=x0_hat,
+            current_eef_pos=context["current_eef_pos"],
+            obstacle_centers_xy=context["obstacle_centers_xy"],
+            obstacle_radii=context["obstacle_radii"],
+            horizon=guidance_horizon,
+            delta_pos_scale=context.get("delta_pos_scale", 1.0),
+            return_stats=True,
+        )
+        rho_t = ObstacleGuidanceUtils.guidance_scale_for_step(
+            guidance_scale=context.get("guidance_scale", 0.0),
+            schedule=context.get("guidance_schedule", "late"),
+            step_index=step_index,
+            num_steps=num_steps,
+        )
+        guided_sample, grad_norm = ObstacleGuidanceUtils.normalized_negative_cost_grad_update(
+            update_sample=step_output.prev_sample,
+            cost=cost,
+            scale=rho_t,
+            grad_source=naction_in,
+        )
+
+        min_distance = cost_stats["min_distance"]
+        self.last_obstacle_guidance_info = dict(
+            applied=True,
+            rho_t=float(rho_t),
+            cost=float(cost.detach().cpu().item()),
+            min_distance=None if min_distance is None else TensorUtils.to_numpy(min_distance),
+            grad_norm=None if grad_norm is None else TensorUtils.to_numpy(grad_norm),
+            num_obstacles=int(cost_stats["num_obstacles"]),
+        )
+        return guided_sample
     
     def get_action(self, obs_dict, goal_dict=None):
         """
@@ -346,20 +441,33 @@ class DiffusionPolicyUNet(PolicyAlgo):
         # init scheduler
         self.noise_scheduler.set_timesteps(num_inference_timesteps)
 
-        for k in self.noise_scheduler.timesteps:
-            # predict noise
-            noise_pred = nets["policy"]["noise_pred_net"](
-                sample=naction, 
-                timestep=k,
-                global_cond=obs_cond
-            )
+        guidance_enabled = self._obstacle_guidance_enabled()
+        self.last_obstacle_guidance_info = dict(applied=False)
+        self.obstacle_guidance_sample_count += 1
+        for step_index, k in enumerate(self.noise_scheduler.timesteps):
+            if guidance_enabled:
+                naction = self._guided_scheduler_step(
+                    nets=nets,
+                    naction=naction,
+                    timestep=k,
+                    obs_cond=obs_cond,
+                    step_index=step_index,
+                    num_steps=len(self.noise_scheduler.timesteps),
+                )
+            else:
+                # predict noise
+                noise_pred = nets["policy"]["noise_pred_net"](
+                    sample=naction,
+                    timestep=k,
+                    global_cond=obs_cond
+                )
 
-            # inverse diffusion step (remove noise)
-            naction = self.noise_scheduler.step(
-                model_output=noise_pred,
-                timestep=k,
-                sample=naction
-            ).prev_sample
+                # inverse diffusion step (remove noise)
+                naction = self.noise_scheduler.step(
+                    model_output=noise_pred,
+                    timestep=k,
+                    sample=naction
+                ).prev_sample
 
         # process action using Ta
         start = To - 1

@@ -50,6 +50,14 @@ Example usage:
     python run_trained_agent.py --agent /path/to/model.pth \
         --n_rollouts 50 --horizon 400 --seed 0 \
         --dataset_path /path/to/output.hdf5
+
+    # Evaluate a masked-image Diffusion Policy with obstacle guidance.
+
+    python run_trained_agent.py --agent /path/to/model.pth \
+        --n_rollouts 50 --horizon 400 --seed 0 \
+        --obstacle_guidance --guidance_scale 0.03 \
+        --obstacle_radius 0.06 --guidance_horizon 8 \
+        --guidance_schedule late --target_object_name Can
 """
 import argparse
 import json
@@ -65,6 +73,7 @@ import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.obs_utils as ObsUtils
+import robomimic.utils.obstacle_guidance_utils as ObstacleGuidanceUtils
 from robomimic.envs.env_base import EnvBase
 from robomimic.envs.wrappers import EnvWrapper
 from robomimic.algo import RolloutPolicy
@@ -103,6 +112,73 @@ def make_target_mask_grid_video_frame(env, obs, camera_names, height=512, width=
     return np.concatenate(rows, axis=0)
 
 
+def get_current_eef_pos_from_obs(obs, obs_key="robot0_eef_pos"):
+    """
+    Return current eef position from a rollout observation dict.
+    """
+    if obs_key not in obs:
+        raise KeyError("Observation key '{}' is required for obstacle guidance".format(obs_key))
+    eef_pos = np.array(obs[obs_key], dtype=np.float32)
+    if eef_pos.ndim == 2:
+        eef_pos = eef_pos[-1]
+    if eef_pos.shape[-1] != 3:
+        raise ValueError("Expected '{}' to have final dimension 3, got {}".format(obs_key, eef_pos.shape))
+    return eef_pos
+
+
+def set_obstacle_guidance_context(policy, env, obs, guidance_config):
+    """
+    Query oracle obstacle state from the env and pass it into the underlying
+    policy for optional inference-time guidance.
+    """
+    algo = getattr(policy, "policy", policy)
+    if not hasattr(algo, "set_obstacle_guidance_context"):
+        raise ValueError("Loaded policy does not support obstacle guidance context")
+
+    if not guidance_config.get("enabled", False):
+        algo.set_obstacle_guidance_context(None)
+        return None
+
+    current_eef_pos = get_current_eef_pos_from_obs(
+        obs=obs,
+        obs_key=guidance_config.get("eef_pos_obs_key", "robot0_eef_pos"),
+    )
+    centers_xy, radii, names = ObstacleGuidanceUtils.get_oracle_obstacle_circles(
+        env=env,
+        target_object_name=guidance_config.get("target_object_name", None),
+        obstacle_names=guidance_config.get("obstacle_names", None),
+        obstacle_radius=guidance_config.get("obstacle_radius", 0.06),
+    )
+
+    context = dict(
+        enabled=True,
+        current_eef_pos=current_eef_pos,
+        obstacle_centers_xy=centers_xy,
+        obstacle_radii=radii,
+        guidance_scale=guidance_config.get("guidance_scale", 0.0),
+        guidance_horizon=guidance_config.get("guidance_horizon", 8),
+        guidance_schedule=guidance_config.get("guidance_schedule", "late"),
+        delta_pos_scale=guidance_config.get("delta_pos_scale", 0.05),
+    )
+    algo.set_obstacle_guidance_context(context)
+    return dict(
+        current_eef_pos=current_eef_pos,
+        obstacle_centers_xy=centers_xy,
+        obstacle_radii=radii,
+        obstacle_names=names,
+    )
+
+
+def min_eef_obstacle_xy_distance(eef_pos, obstacle_centers_xy):
+    """
+    Compute current xy distance from eef to nearest obstacle.
+    """
+    if obstacle_centers_xy is None or len(obstacle_centers_xy) == 0:
+        return None
+    dist = np.linalg.norm(np.array(obstacle_centers_xy) - np.array(eef_pos[:2])[None], axis=-1)
+    return float(np.min(dist))
+
+
 def rollout(
     policy,
     env,
@@ -113,6 +189,7 @@ def rollout(
     return_obs=False,
     camera_names=None,
     video_target_mask_grid=False,
+    obstacle_guidance_config=None,
 ):
     """
     Helper function to carry out rollouts. Supports on-screen rendering, off-screen rendering to a video, 
@@ -153,11 +230,45 @@ def rollout(
     if return_obs:
         # store observations too
         traj.update(dict(obs=[], next_obs=[]))
+    guidance_costs = []
+    guidance_min_distances = []
+    actual_min_distances = []
+    guidance_chunk_count = getattr(getattr(policy, "policy", policy), "obstacle_guidance_sample_count", 0)
+    obstacle_log_printed = False
+
     try:
         for step_i in range(horizon):
 
             # get action from policy
+            obstacle_info = None
+            if obstacle_guidance_config is not None and obstacle_guidance_config.get("enabled", False):
+                obstacle_info = set_obstacle_guidance_context(
+                    policy=policy,
+                    env=env,
+                    obs=obs,
+                    guidance_config=obstacle_guidance_config,
+                )
+                if not obstacle_log_printed:
+                    print("Obstacle guidance objects: {}".format(obstacle_info["obstacle_names"]))
+                    print("Obstacle guidance centers xy: {}".format(obstacle_info["obstacle_centers_xy"].tolist()))
+                    obstacle_log_printed = True
+                actual_min_dist = min_eef_obstacle_xy_distance(
+                    eef_pos=obstacle_info["current_eef_pos"],
+                    obstacle_centers_xy=obstacle_info["obstacle_centers_xy"],
+                )
+                if actual_min_dist is not None:
+                    actual_min_distances.append(actual_min_dist)
             act = policy(ob=obs)
+            algo = getattr(policy, "policy", policy)
+            new_guidance_chunk_count = getattr(algo, "obstacle_guidance_sample_count", guidance_chunk_count)
+            if new_guidance_chunk_count != guidance_chunk_count:
+                guidance_info = getattr(algo, "last_obstacle_guidance_info", None)
+                if guidance_info is not None and guidance_info.get("applied", False):
+                    guidance_costs.append(guidance_info["cost"])
+                    min_distance = guidance_info.get("min_distance", None)
+                    if min_distance is not None:
+                        guidance_min_distances.append(float(np.min(min_distance)))
+                guidance_chunk_count = new_guidance_chunk_count
 
             # play action
             next_obs, r, done, _ = env.step(act)
@@ -208,6 +319,15 @@ def rollout(
         print("WARNING: got rollout exception {}".format(e))
 
     stats = dict(Return=total_reward, Horizon=(step_i + 1), Success_Rate=float(success))
+    if obstacle_guidance_config is not None and obstacle_guidance_config.get("enabled", False):
+        stats["Obstacle_Guidance_Applied"] = float(len(guidance_costs) > 0)
+        stats["Obstacle_Guidance_Cost"] = float(np.mean(guidance_costs)) if len(guidance_costs) > 0 else 0.0
+        stats["Obstacle_Guidance_Min_Distance"] = (
+            float(np.min(guidance_min_distances)) if len(guidance_min_distances) > 0 else 0.0
+        )
+        stats["Actual_Min_Eef_Obstacle_Distance"] = (
+            float(np.min(actual_min_distances)) if len(actual_min_distances) > 0 else 0.0
+        )
 
     if return_obs:
         # convert list of dict to dict of list for obs dictionaries (for convenient writes to hdf5 dataset)
@@ -236,6 +356,17 @@ def run_trained_agent(args):
         assert len(args.camera_names) == 1
     if args.video_target_mask_grid and args.camera_names == ["agentview"]:
         args.camera_names = ["agentview", "robot0_eye_in_hand"]
+    obstacle_guidance_config = dict(
+        enabled=args.obstacle_guidance,
+        guidance_scale=args.guidance_scale,
+        obstacle_radius=args.obstacle_radius,
+        guidance_horizon=args.guidance_horizon,
+        guidance_schedule=args.guidance_schedule,
+        target_object_name=args.target_object_name,
+        obstacle_names=args.obstacle_names,
+        eef_pos_obs_key=args.eef_pos_obs_key,
+        delta_pos_scale=args.delta_pos_scale,
+    )
 
     # relative path to agent
     ckpt_path = args.agent
@@ -292,6 +423,7 @@ def run_trained_agent(args):
             return_obs=(write_dataset and args.dataset_obs),
             camera_names=args.camera_names,
             video_target_mask_grid=args.video_target_mask_grid,
+            obstacle_guidance_config=obstacle_guidance_config,
         )
         rollout_stats.append(stats)
 
@@ -402,6 +534,62 @@ if __name__ == "__main__":
         "--video_target_mask_grid",
         action="store_true",
         help="render a 2-column video per camera: original RGB on the left and policy image observation on the right",
+    )
+
+    parser.add_argument(
+        "--obstacle_guidance",
+        action="store_true",
+        help="enable inference-time obstacle guidance for diffusion policy sampling",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=0.03,
+        help="obstacle guidance gradient step scale",
+    )
+    parser.add_argument(
+        "--obstacle_radius",
+        type=float,
+        default=0.06,
+        help="fixed xy safety radius for each obstacle object in meters",
+    )
+    parser.add_argument(
+        "--guidance_horizon",
+        type=int,
+        default=8,
+        help="number of predicted action steps used in obstacle cost",
+    )
+    parser.add_argument(
+        "--guidance_schedule",
+        type=str,
+        choices=["constant", "late"],
+        default="late",
+        help="guidance scale schedule over denoising steps",
+    )
+    parser.add_argument(
+        "--target_object_name",
+        type=str,
+        default="Can",
+        help="object name to exclude from obstacle guidance",
+    )
+    parser.add_argument(
+        "--obstacle_names",
+        type=str,
+        nargs="*",
+        default=None,
+        help="optional explicit obstacle object names; defaults to all non-target objects",
+    )
+    parser.add_argument(
+        "--eef_pos_obs_key",
+        type=str,
+        default="robot0_eef_pos",
+        help="observation key used for current end-effector position",
+    )
+    parser.add_argument(
+        "--delta_pos_scale",
+        type=float,
+        default=0.05,
+        help="scale from normalized action xyz dimensions to meters for guidance geometry",
     )
 
     # If provided, an hdf5 file will be written with the rollout data
