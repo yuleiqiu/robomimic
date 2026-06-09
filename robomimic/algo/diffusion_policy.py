@@ -290,7 +290,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
             return False
         if not context.get("enabled", False):
             return False
-        centers = context.get("obstacle_centers_xy", None)
+        centers = context.get("obstacle_centers_xyz", context.get("obstacle_centers_xy", None))
         radii = context.get("obstacle_radii", None)
         if centers is None or radii is None:
             return False
@@ -332,15 +332,38 @@ class DiffusionPolicyUNet(PolicyAlgo):
         )
 
         guidance_horizon = context.get("guidance_horizon", self.algo_config.horizon.action_horizon)
-        cost, cost_stats = ObstacleGuidanceUtils.obstacle_xy_cost(
+        guidance_mode = context.get("guidance_mode", "xyz_cylinder")
+        x0_for_cost = ObstacleGuidanceUtils.unnormalize_action_chunk(
             action_chunk=x0_hat,
-            current_eef_pos=context["current_eef_pos"],
-            obstacle_centers_xy=context["obstacle_centers_xy"],
-            obstacle_radii=context["obstacle_radii"],
-            horizon=guidance_horizon,
-            delta_pos_scale=context.get("delta_pos_scale", 1.0),
-            return_stats=True,
+            action_scale=context.get("action_scale", None),
+            action_offset=context.get("action_offset", None),
         )
+        if guidance_mode == "xy":
+            cost, cost_stats = ObstacleGuidanceUtils.obstacle_xy_cost(
+                action_chunk=x0_for_cost,
+                current_eef_pos=context["current_eef_pos"],
+                obstacle_centers_xy=context["obstacle_centers_xyz"],
+                obstacle_radii=context["obstacle_radii"],
+                horizon=guidance_horizon,
+                delta_pos_scale=context.get("delta_pos_scale", 1.0),
+                delta_pos_offset=context.get("delta_pos_offset", 0.0),
+                return_stats=True,
+            )
+        elif guidance_mode == "xyz_cylinder":
+            cost, cost_stats = ObstacleGuidanceUtils.obstacle_xyz_cylinder_cost(
+                action_chunk=x0_for_cost,
+                current_eef_pos=context["current_eef_pos"],
+                obstacle_centers_xyz=context["obstacle_centers_xyz"],
+                obstacle_radii=context["obstacle_radii"],
+                obstacle_top_z=context["obstacle_top_z"],
+                z_clearance=context.get("z_clearance", 0.03),
+                horizon=guidance_horizon,
+                delta_pos_scale=context.get("delta_pos_scale", 1.0),
+                delta_pos_offset=context.get("delta_pos_offset", 0.0),
+                return_stats=True,
+            )
+        else:
+            raise ValueError("Unsupported obstacle guidance mode '{}'".format(guidance_mode))
         rho_t = ObstacleGuidanceUtils.guidance_scale_for_step(
             guidance_scale=context.get("guidance_scale", 0.0),
             schedule=context.get("guidance_schedule", "late"),
@@ -354,14 +377,21 @@ class DiffusionPolicyUNet(PolicyAlgo):
             grad_source=naction_in,
         )
 
-        min_distance = cost_stats["min_distance"]
+        min_xy_distance = cost_stats["min_xy_distance"]
+        min_z_clearance = cost_stats.get("min_z_clearance", None)
         self.last_obstacle_guidance_info = dict(
             applied=True,
+            guidance_mode=guidance_mode,
             rho_t=float(rho_t),
             cost=float(cost.detach().cpu().item()),
-            min_distance=None if min_distance is None else TensorUtils.to_numpy(min_distance),
+            min_distance=None if min_xy_distance is None else TensorUtils.to_numpy(min_xy_distance),
+            min_xy_distance=None if min_xy_distance is None else TensorUtils.to_numpy(min_xy_distance),
+            min_z_clearance=None if min_z_clearance is None else TensorUtils.to_numpy(min_z_clearance),
             grad_norm=None if grad_norm is None else TensorUtils.to_numpy(grad_norm),
             num_obstacles=int(cost_stats["num_obstacles"]),
+            obstacle_top_z=context.get("obstacle_top_z", None),
+            z_clearance=context.get("z_clearance", None),
+            delta_pos_scale=context.get("delta_pos_scale", None),
         )
         return guided_sample
     

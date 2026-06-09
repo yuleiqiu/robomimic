@@ -56,7 +56,7 @@ Example usage:
     python run_trained_agent.py --agent /path/to/model.pth \
         --n_rollouts 50 --horizon 400 --seed 0 \
         --obstacle_guidance --guidance_scale 0.03 \
-        --obstacle_radius 0.06 --guidance_horizon 8 \
+        --guidance_mode xyz_cylinder --xy_clearance 0.02 --z_clearance 0.03 --guidance_horizon 8 \
         --guidance_schedule late --target_object_name Can
 """
 import argparse
@@ -126,6 +126,23 @@ def get_current_eef_pos_from_obs(obs, obs_key="robot0_eef_pos"):
     return eef_pos
 
 
+def get_action_normalization_vector(policy):
+    """
+    Return flat action unnormalization scale / offset from RolloutPolicy stats.
+    """
+    stats = getattr(policy, "action_normalization_stats", None)
+    if stats is None:
+        return None, None
+    algo = getattr(policy, "policy", policy)
+    action_keys = algo.global_config.train.action_keys
+    scales = []
+    offsets = []
+    for key in action_keys:
+        scales.append(np.array(stats[key]["scale"], dtype=np.float32).reshape(-1))
+        offsets.append(np.array(stats[key]["offset"], dtype=np.float32).reshape(-1))
+    return np.concatenate(scales, axis=0), np.concatenate(offsets, axis=0)
+
+
 def set_obstacle_guidance_context(policy, env, obs, guidance_config):
     """
     Query oracle obstacle state from the env and pass it into the underlying
@@ -143,40 +160,67 @@ def set_obstacle_guidance_context(policy, env, obs, guidance_config):
         obs=obs,
         obs_key=guidance_config.get("eef_pos_obs_key", "robot0_eef_pos"),
     )
-    centers_xy, radii, names = ObstacleGuidanceUtils.get_oracle_obstacle_circles(
+    centers_xyz, physical_radii, safety_radii, top_z, names = ObstacleGuidanceUtils.get_oracle_obstacle_geometry(
         env=env,
         target_object_name=guidance_config.get("target_object_name", None),
         obstacle_names=guidance_config.get("obstacle_names", None),
-        obstacle_radius=guidance_config.get("obstacle_radius", 0.06),
+        xy_clearance=guidance_config.get("xy_clearance", 0.02),
     )
+    delta_pos_scale, delta_pos_offset = ObstacleGuidanceUtils.get_controller_delta_pos_mapping(env)
+    action_scale, action_offset = get_action_normalization_vector(policy)
 
     context = dict(
         enabled=True,
+        guidance_mode=guidance_config.get("guidance_mode", "xyz_cylinder"),
         current_eef_pos=current_eef_pos,
-        obstacle_centers_xy=centers_xy,
-        obstacle_radii=radii,
+        obstacle_centers_xyz=centers_xyz,
+        obstacle_physical_radii=physical_radii,
+        obstacle_radii=safety_radii,
+        obstacle_top_z=top_z,
+        xy_clearance=guidance_config.get("xy_clearance", 0.02),
+        z_clearance=guidance_config.get("z_clearance", 0.03),
         guidance_scale=guidance_config.get("guidance_scale", 0.0),
         guidance_horizon=guidance_config.get("guidance_horizon", 8),
         guidance_schedule=guidance_config.get("guidance_schedule", "late"),
-        delta_pos_scale=guidance_config.get("delta_pos_scale", 0.05),
+        delta_pos_scale=delta_pos_scale,
+        delta_pos_offset=delta_pos_offset,
+        action_scale=action_scale,
+        action_offset=action_offset,
     )
     algo.set_obstacle_guidance_context(context)
     return dict(
         current_eef_pos=current_eef_pos,
-        obstacle_centers_xy=centers_xy,
-        obstacle_radii=radii,
+        guidance_mode=context["guidance_mode"],
+        obstacle_centers_xyz=centers_xyz,
+        obstacle_physical_radii=physical_radii,
+        obstacle_radii=safety_radii,
+        obstacle_top_z=top_z,
         obstacle_names=names,
+        xy_clearance=context["xy_clearance"],
+        z_clearance=context["z_clearance"],
+        delta_pos_scale=delta_pos_scale,
     )
 
 
-def min_eef_obstacle_xy_distance(eef_pos, obstacle_centers_xy):
+def min_eef_obstacle_xy_distance(eef_pos, obstacle_centers):
     """
     Compute current xy distance from eef to nearest obstacle.
     """
-    if obstacle_centers_xy is None or len(obstacle_centers_xy) == 0:
+    if obstacle_centers is None or len(obstacle_centers) == 0:
         return None
-    dist = np.linalg.norm(np.array(obstacle_centers_xy) - np.array(eef_pos[:2])[None], axis=-1)
+    centers_xy = np.array(obstacle_centers)[..., :2]
+    dist = np.linalg.norm(centers_xy - np.array(eef_pos[:2])[None], axis=-1)
     return float(np.min(dist))
+
+
+def min_eef_obstacle_z_clearance(eef_pos, obstacle_top_z, z_clearance):
+    """
+    Compute current z clearance from eef to nearest obstacle z limit.
+    """
+    if obstacle_top_z is None or len(obstacle_top_z) == 0:
+        return None
+    clearance = float(eef_pos[2]) - (np.array(obstacle_top_z, dtype=np.float32) + float(z_clearance))
+    return float(np.min(clearance))
 
 
 def rollout(
@@ -232,7 +276,9 @@ def rollout(
         traj.update(dict(obs=[], next_obs=[]))
     guidance_costs = []
     guidance_min_distances = []
+    guidance_min_z_clearances = []
     actual_min_distances = []
+    actual_min_z_clearances = []
     guidance_chunk_count = getattr(getattr(policy, "policy", policy), "obstacle_guidance_sample_count", 0)
     obstacle_log_printed = False
 
@@ -249,15 +295,29 @@ def rollout(
                     guidance_config=obstacle_guidance_config,
                 )
                 if not obstacle_log_printed:
+                    print("Obstacle guidance mode: {}".format(obstacle_info["guidance_mode"]))
                     print("Obstacle guidance objects: {}".format(obstacle_info["obstacle_names"]))
-                    print("Obstacle guidance centers xy: {}".format(obstacle_info["obstacle_centers_xy"].tolist()))
+                    print("Obstacle guidance centers xyz: {}".format(obstacle_info["obstacle_centers_xyz"].tolist()))
+                    print("Obstacle guidance physical xy radii: {}".format(obstacle_info["obstacle_physical_radii"].tolist()))
+                    print("Obstacle guidance safety radii: {}".format(obstacle_info["obstacle_radii"].tolist()))
+                    print("Obstacle guidance top z: {}".format(obstacle_info["obstacle_top_z"].tolist()))
+                    print("Obstacle guidance xy_clearance: {}".format(obstacle_info["xy_clearance"]))
+                    print("Obstacle guidance z_clearance: {}".format(obstacle_info["z_clearance"]))
+                    print("Obstacle guidance delta_pos_scale: {}".format(obstacle_info["delta_pos_scale"].tolist()))
                     obstacle_log_printed = True
                 actual_min_dist = min_eef_obstacle_xy_distance(
                     eef_pos=obstacle_info["current_eef_pos"],
-                    obstacle_centers_xy=obstacle_info["obstacle_centers_xy"],
+                    obstacle_centers=obstacle_info["obstacle_centers_xyz"],
                 )
                 if actual_min_dist is not None:
                     actual_min_distances.append(actual_min_dist)
+                actual_min_z_clearance = min_eef_obstacle_z_clearance(
+                    eef_pos=obstacle_info["current_eef_pos"],
+                    obstacle_top_z=obstacle_info["obstacle_top_z"],
+                    z_clearance=obstacle_info["z_clearance"],
+                )
+                if actual_min_z_clearance is not None:
+                    actual_min_z_clearances.append(actual_min_z_clearance)
             act = policy(ob=obs)
             algo = getattr(policy, "policy", policy)
             new_guidance_chunk_count = getattr(algo, "obstacle_guidance_sample_count", guidance_chunk_count)
@@ -265,9 +325,12 @@ def rollout(
                 guidance_info = getattr(algo, "last_obstacle_guidance_info", None)
                 if guidance_info is not None and guidance_info.get("applied", False):
                     guidance_costs.append(guidance_info["cost"])
-                    min_distance = guidance_info.get("min_distance", None)
-                    if min_distance is not None:
-                        guidance_min_distances.append(float(np.min(min_distance)))
+                    min_xy_distance = guidance_info.get("min_xy_distance", guidance_info.get("min_distance", None))
+                    if min_xy_distance is not None:
+                        guidance_min_distances.append(float(np.min(min_xy_distance)))
+                    min_z_clearance = guidance_info.get("min_z_clearance", None)
+                    if min_z_clearance is not None:
+                        guidance_min_z_clearances.append(float(np.min(min_z_clearance)))
                 guidance_chunk_count = new_guidance_chunk_count
 
             # play action
@@ -325,8 +388,15 @@ def rollout(
         stats["Obstacle_Guidance_Min_Distance"] = (
             float(np.min(guidance_min_distances)) if len(guidance_min_distances) > 0 else 0.0
         )
+        stats["Obstacle_Guidance_Min_XY_Distance"] = stats["Obstacle_Guidance_Min_Distance"]
+        stats["Obstacle_Guidance_Min_Z_Clearance"] = (
+            float(np.min(guidance_min_z_clearances)) if len(guidance_min_z_clearances) > 0 else 0.0
+        )
         stats["Actual_Min_Eef_Obstacle_Distance"] = (
             float(np.min(actual_min_distances)) if len(actual_min_distances) > 0 else 0.0
+        )
+        stats["Actual_Min_Eef_Obstacle_Z_Clearance"] = (
+            float(np.min(actual_min_z_clearances)) if len(actual_min_z_clearances) > 0 else 0.0
         )
 
     if return_obs:
@@ -358,14 +428,15 @@ def run_trained_agent(args):
         args.camera_names = ["agentview", "robot0_eye_in_hand"]
     obstacle_guidance_config = dict(
         enabled=args.obstacle_guidance,
+        guidance_mode=args.guidance_mode,
         guidance_scale=args.guidance_scale,
-        obstacle_radius=args.obstacle_radius,
+        xy_clearance=args.xy_clearance,
+        z_clearance=args.z_clearance,
         guidance_horizon=args.guidance_horizon,
         guidance_schedule=args.guidance_schedule,
         target_object_name=args.target_object_name,
         obstacle_names=args.obstacle_names,
         eef_pos_obs_key=args.eef_pos_obs_key,
-        delta_pos_scale=args.delta_pos_scale,
     )
 
     # relative path to agent
@@ -548,10 +619,23 @@ if __name__ == "__main__":
         help="obstacle guidance gradient step scale",
     )
     parser.add_argument(
-        "--obstacle_radius",
+        "--guidance_mode",
+        type=str,
+        choices=["xy", "xyz_cylinder"],
+        default="xyz_cylinder",
+        help="obstacle guidance cost mode",
+    )
+    parser.add_argument(
+        "--xy_clearance",
         type=float,
-        default=0.06,
-        help="fixed xy safety radius for each obstacle object in meters",
+        default=0.02,
+        help="xy safety margin added to simulator-derived obstacle radius in meters",
+    )
+    parser.add_argument(
+        "--z_clearance",
+        type=float,
+        default=0.03,
+        help="minimum eef clearance above obstacle top z in meters for xyz_cylinder guidance",
     )
     parser.add_argument(
         "--guidance_horizon",
@@ -584,12 +668,6 @@ if __name__ == "__main__":
         type=str,
         default="robot0_eef_pos",
         help="observation key used for current end-effector position",
-    )
-    parser.add_argument(
-        "--delta_pos_scale",
-        type=float,
-        default=0.05,
-        help="scale from normalized action xyz dimensions to meters for guidance geometry",
     )
 
     # If provided, an hdf5 file will be written with the rollout data
