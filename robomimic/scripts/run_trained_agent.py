@@ -186,6 +186,10 @@ def set_obstacle_guidance_context(policy, env, obs, guidance_config):
         delta_pos_offset=delta_pos_offset,
         action_scale=action_scale,
         action_offset=action_offset,
+        final_collision_refine=guidance_config.get("final_collision_refine", False),
+        collision_refine_steps=guidance_config.get("collision_refine_steps", 5),
+        collision_refine_scale=guidance_config.get("collision_refine_scale", 0.02),
+        final_collision_cost_threshold=guidance_config.get("final_collision_cost_threshold", 1e-8),
     )
     algo.set_obstacle_guidance_context(context)
     return dict(
@@ -277,6 +281,9 @@ def rollout(
     guidance_costs = []
     guidance_min_distances = []
     guidance_min_z_clearances = []
+    final_collision_costs_before = []
+    final_collision_costs_after = []
+    final_collision_free = []
     actual_min_distances = []
     actual_min_z_clearances = []
     guidance_chunk_count = getattr(getattr(policy, "policy", policy), "obstacle_guidance_sample_count", 0)
@@ -331,6 +338,15 @@ def rollout(
                     min_z_clearance = guidance_info.get("min_z_clearance", None)
                     if min_z_clearance is not None:
                         guidance_min_z_clearances.append(float(np.min(min_z_clearance)))
+                    final_cost_before = guidance_info.get("final_collision_cost_before", None)
+                    if final_cost_before is not None:
+                        final_collision_costs_before.append(float(final_cost_before))
+                    final_cost_after = guidance_info.get("final_collision_cost_after", None)
+                    if final_cost_after is not None:
+                        final_collision_costs_after.append(float(final_cost_after))
+                    final_is_free = guidance_info.get("final_collision_free", None)
+                    if final_is_free is not None:
+                        final_collision_free.append(float(final_is_free))
                 guidance_chunk_count = new_guidance_chunk_count
 
             # play action
@@ -392,6 +408,15 @@ def rollout(
         stats["Obstacle_Guidance_Min_Z_Clearance"] = (
             float(np.min(guidance_min_z_clearances)) if len(guidance_min_z_clearances) > 0 else 0.0
         )
+        stats["Final_Collision_Cost_Before_Refine"] = (
+            float(np.mean(final_collision_costs_before)) if len(final_collision_costs_before) > 0 else 0.0
+        )
+        stats["Final_Collision_Cost_After_Refine"] = (
+            float(np.mean(final_collision_costs_after)) if len(final_collision_costs_after) > 0 else 0.0
+        )
+        stats["Final_Collision_Free_Rate"] = (
+            float(np.mean(final_collision_free)) if len(final_collision_free) > 0 else 0.0
+        )
         stats["Actual_Min_Eef_Obstacle_Distance"] = (
             float(np.min(actual_min_distances)) if len(actual_min_distances) > 0 else 0.0
         )
@@ -437,6 +462,10 @@ def run_trained_agent(args):
         target_object_name=args.target_object_name,
         obstacle_names=args.obstacle_names,
         eef_pos_obs_key=args.eef_pos_obs_key,
+        final_collision_refine=args.final_collision_refine,
+        collision_refine_steps=args.collision_refine_steps,
+        collision_refine_scale=args.collision_refine_scale,
+        final_collision_cost_threshold=args.final_collision_cost_threshold,
     )
 
     # relative path to agent
@@ -649,6 +678,29 @@ if __name__ == "__main__":
         choices=["constant", "late"],
         default="late",
         help="guidance scale schedule over denoising steps",
+    )
+    parser.add_argument(
+        "--final_collision_refine",
+        action="store_true",
+        help="repair the final executable action chunk with post-hoc obstacle-cost gradient steps",
+    )
+    parser.add_argument(
+        "--collision_refine_steps",
+        type=int,
+        default=5,
+        help="maximum number of post-hoc collision refinement gradient steps",
+    )
+    parser.add_argument(
+        "--collision_refine_scale",
+        type=float,
+        default=0.02,
+        help="normalized gradient step scale for post-hoc collision refinement",
+    )
+    parser.add_argument(
+        "--final_collision_cost_threshold",
+        type=float,
+        default=1e-8,
+        help="surrogate obstacle cost threshold considered collision-free after final refinement",
     )
     parser.add_argument(
         "--target_object_name",

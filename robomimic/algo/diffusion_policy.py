@@ -298,6 +298,50 @@ class DiffusionPolicyUNet(PolicyAlgo):
             return False
         return context.get("guidance_scale", 0.0) > 0.0
 
+    def _obstacle_guidance_cost(self, action_chunk, horizon=None, return_stats=True):
+        """
+        Compute obstacle guidance cost for an action chunk in policy action coordinates.
+        """
+        context = self.obstacle_guidance_context
+        if horizon is None:
+            horizon = context.get("guidance_horizon", self.algo_config.horizon.action_horizon)
+        guidance_mode = context.get("guidance_mode", "xyz_cylinder")
+        action_for_cost = ObstacleGuidanceUtils.unnormalize_action_chunk(
+            action_chunk=action_chunk,
+            action_scale=context.get("action_scale", None),
+            action_offset=context.get("action_offset", None),
+        )
+        if guidance_mode == "xy":
+            return ObstacleGuidanceUtils.obstacle_xy_cost(
+                action_chunk=action_for_cost,
+                current_eef_pos=context["current_eef_pos"],
+                obstacle_centers_xy=context["obstacle_centers_xyz"],
+                obstacle_radii=context["obstacle_radii"],
+                horizon=horizon,
+                delta_pos_scale=context.get("delta_pos_scale", 1.0),
+                delta_pos_offset=context.get("delta_pos_offset", 0.0),
+                return_stats=return_stats,
+            )
+        if guidance_mode == "xyz_cylinder":
+            return ObstacleGuidanceUtils.obstacle_xyz_cylinder_cost(
+                action_chunk=action_for_cost,
+                current_eef_pos=context["current_eef_pos"],
+                obstacle_centers_xyz=context["obstacle_centers_xyz"],
+                obstacle_radii=context["obstacle_radii"],
+                obstacle_top_z=context["obstacle_top_z"],
+                z_clearance=context.get("z_clearance", 0.03),
+                horizon=horizon,
+                delta_pos_scale=context.get("delta_pos_scale", 1.0),
+                delta_pos_offset=context.get("delta_pos_offset", 0.0),
+                return_stats=return_stats,
+            )
+        raise ValueError("Unsupported obstacle guidance mode '{}'".format(guidance_mode))
+
+    def _update_last_obstacle_guidance_info(self, updates):
+        if self.last_obstacle_guidance_info is None:
+            self.last_obstacle_guidance_info = dict(applied=True)
+        self.last_obstacle_guidance_info.update(updates)
+
     def _guided_scheduler_step(
         self,
         nets,
@@ -331,39 +375,12 @@ class DiffusionPolicyUNet(PolicyAlgo):
             step_output=step_output,
         )
 
-        guidance_horizon = context.get("guidance_horizon", self.algo_config.horizon.action_horizon)
         guidance_mode = context.get("guidance_mode", "xyz_cylinder")
-        x0_for_cost = ObstacleGuidanceUtils.unnormalize_action_chunk(
+        cost, cost_stats = self._obstacle_guidance_cost(
             action_chunk=x0_hat,
-            action_scale=context.get("action_scale", None),
-            action_offset=context.get("action_offset", None),
+            horizon=context.get("guidance_horizon", self.algo_config.horizon.action_horizon),
+            return_stats=True,
         )
-        if guidance_mode == "xy":
-            cost, cost_stats = ObstacleGuidanceUtils.obstacle_xy_cost(
-                action_chunk=x0_for_cost,
-                current_eef_pos=context["current_eef_pos"],
-                obstacle_centers_xy=context["obstacle_centers_xyz"],
-                obstacle_radii=context["obstacle_radii"],
-                horizon=guidance_horizon,
-                delta_pos_scale=context.get("delta_pos_scale", 1.0),
-                delta_pos_offset=context.get("delta_pos_offset", 0.0),
-                return_stats=True,
-            )
-        elif guidance_mode == "xyz_cylinder":
-            cost, cost_stats = ObstacleGuidanceUtils.obstacle_xyz_cylinder_cost(
-                action_chunk=x0_for_cost,
-                current_eef_pos=context["current_eef_pos"],
-                obstacle_centers_xyz=context["obstacle_centers_xyz"],
-                obstacle_radii=context["obstacle_radii"],
-                obstacle_top_z=context["obstacle_top_z"],
-                z_clearance=context.get("z_clearance", 0.03),
-                horizon=guidance_horizon,
-                delta_pos_scale=context.get("delta_pos_scale", 1.0),
-                delta_pos_offset=context.get("delta_pos_offset", 0.0),
-                return_stats=True,
-            )
-        else:
-            raise ValueError("Unsupported obstacle guidance mode '{}'".format(guidance_mode))
         rho_t = ObstacleGuidanceUtils.guidance_scale_for_step(
             guidance_scale=context.get("guidance_scale", 0.0),
             schedule=context.get("guidance_schedule", "late"),
@@ -394,6 +411,66 @@ class DiffusionPolicyUNet(PolicyAlgo):
             delta_pos_scale=context.get("delta_pos_scale", None),
         )
         return guided_sample
+
+    def _refine_obstacle_guidance_action(self, action):
+        """
+        Optionally repair the final clean action chunk with post-hoc obstacle
+        cost gradient steps before the action queue is populated.
+        """
+        context = self.obstacle_guidance_context
+        if context is None or not context.get("final_collision_refine", False):
+            return action
+
+        threshold = context.get("final_collision_cost_threshold", 1e-8)
+        num_steps = int(context.get("collision_refine_steps", 5))
+        scale = context.get("collision_refine_scale", 0.02)
+        refined = action.detach()
+        initial_cost = None
+        final_cost = None
+        final_stats = None
+        last_grad_norm = None
+        steps_taken = 0
+
+        for step in range(max(num_steps, 0) + 1):
+            refined_in = refined.detach().requires_grad_(step < num_steps)
+            cost, cost_stats = self._obstacle_guidance_cost(
+                action_chunk=refined_in,
+                horizon=refined_in.shape[1],
+                return_stats=True,
+            )
+            cost_value = float(cost.detach().cpu().item())
+            if initial_cost is None:
+                initial_cost = cost_value
+            final_cost = cost_value
+            final_stats = cost_stats
+            if cost_value <= threshold or step == num_steps:
+                refined = refined_in.detach()
+                break
+
+            refined, last_grad_norm = ObstacleGuidanceUtils.normalized_negative_cost_grad_update(
+                update_sample=refined_in,
+                cost=cost,
+                scale=scale,
+                grad_source=refined_in,
+            )
+            refined = torch.clamp(refined, -1.0, 1.0)
+            steps_taken += 1
+
+        min_xy_distance = final_stats["min_xy_distance"] if final_stats is not None else None
+        min_z_clearance = None if final_stats is None else final_stats.get("min_z_clearance", None)
+        self._update_last_obstacle_guidance_info(dict(
+            applied=True,
+            final_collision_refine=True,
+            final_collision_cost_before=initial_cost,
+            final_collision_cost_after=final_cost,
+            final_collision_free=bool(final_cost is not None and final_cost <= threshold),
+            final_collision_threshold=float(threshold),
+            collision_refine_steps=steps_taken,
+            collision_refine_grad_norm=None if last_grad_norm is None else TensorUtils.to_numpy(last_grad_norm),
+            final_min_xy_distance=None if min_xy_distance is None else TensorUtils.to_numpy(min_xy_distance),
+            final_min_z_clearance=None if min_z_clearance is None else TensorUtils.to_numpy(min_z_clearance),
+        ))
+        return refined.detach()
     
     def get_action(self, obs_dict, goal_dict=None):
         """
@@ -472,6 +549,12 @@ class DiffusionPolicyUNet(PolicyAlgo):
         self.noise_scheduler.set_timesteps(num_inference_timesteps)
 
         guidance_enabled = self._obstacle_guidance_enabled()
+        context = self.obstacle_guidance_context
+        final_refine_enabled = (
+            context is not None
+            and context.get("enabled", False)
+            and context.get("final_collision_refine", False)
+        )
         self.last_obstacle_guidance_info = dict(applied=False)
         self.obstacle_guidance_sample_count += 1
         for step_index, k in enumerate(self.noise_scheduler.timesteps):
@@ -503,6 +586,8 @@ class DiffusionPolicyUNet(PolicyAlgo):
         start = To - 1
         end = start + Ta
         action = naction[:,start:end]
+        if guidance_enabled or final_refine_enabled:
+            action = self._refine_obstacle_guidance_action(action)
         return action
 
     def serialize(self):
