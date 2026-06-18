@@ -61,6 +61,7 @@ Example usage:
 """
 import argparse
 import json
+import os
 import h5py
 import imageio
 import numpy as np
@@ -77,6 +78,21 @@ import robomimic.utils.obstacle_guidance_utils as ObstacleGuidanceUtils
 from robomimic.envs.env_base import EnvBase
 from robomimic.envs.wrappers import EnvWrapper
 from robomimic.algo import RolloutPolicy
+
+
+def make_json_serializable(x):
+    """
+    Convert numpy values to Python containers for json dumping.
+    """
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, np.generic):
+        return x.item()
+    if isinstance(x, dict):
+        return {k: make_json_serializable(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [make_json_serializable(v) for v in x]
+    return x
 
 
 def resize_nearest(image, height, width):
@@ -238,6 +254,8 @@ def rollout(
     camera_names=None,
     video_target_mask_grid=False,
     obstacle_guidance_config=None,
+    progress_prefix=None,
+    progress_interval=100,
 ):
     """
     Helper function to carry out rollouts. Supports on-screen rendering, off-screen rendering to a video, 
@@ -390,6 +408,14 @@ def rollout(
             if done or success:
                 break
 
+            if (
+                progress_prefix is not None
+                and progress_interval is not None
+                and progress_interval > 0
+                and ((step_i + 1) % progress_interval == 0)
+            ):
+                print("{} step {}/{}".format(progress_prefix, step_i + 1, horizon), flush=True)
+
             # update for next iter
             obs = deepcopy(next_obs)
             state_dict = env.get_state()
@@ -475,7 +501,7 @@ def run_trained_agent(args):
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
 
     # restore policy
-    policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=ckpt_path, device=device, verbose=True)
+    policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=ckpt_path, device=device, verbose=args.verbose_load)
 
     # read rollout settings
     rollout_num_episodes = args.n_rollouts
@@ -491,7 +517,7 @@ def run_trained_agent(args):
         env_name=args.env, 
         render=args.render, 
         render_offscreen=(args.video_path is not None), 
-        verbose=True,
+        verbose=args.verbose_load,
     )
 
     # maybe set seed
@@ -513,6 +539,8 @@ def run_trained_agent(args):
 
     rollout_stats = []
     for i in range(rollout_num_episodes):
+        progress_prefix = "Rollout {}/{}".format(i + 1, rollout_num_episodes)
+        print("{} start".format(progress_prefix), flush=True)
         stats, traj = rollout(
             policy=policy, 
             env=env, 
@@ -524,8 +552,19 @@ def run_trained_agent(args):
             camera_names=args.camera_names,
             video_target_mask_grid=args.video_target_mask_grid,
             obstacle_guidance_config=obstacle_guidance_config,
+            progress_prefix=progress_prefix,
+            progress_interval=args.progress_interval,
         )
         rollout_stats.append(stats)
+        print(
+            "{} done: horizon={}, success={}, return={:.4f}".format(
+                progress_prefix,
+                stats["Horizon"],
+                int(stats["Success_Rate"]),
+                stats["Return"],
+            ),
+            flush=True,
+        )
 
         if write_dataset:
             # store transitions
@@ -560,6 +599,27 @@ def run_trained_agent(args):
         data_grp.attrs["env_args"] = json.dumps(env.serialize(), indent=4) # environment info
         data_writer.close()
         print("Wrote dataset trajectories to {}".format(args.dataset_path))
+
+    if write_video:
+        stats_path = os.path.splitext(args.video_path)[0] + "_stats.json"
+        stats_payload = dict(
+            agent=args.agent,
+            env=args.env,
+            seed=args.seed,
+            horizon=rollout_horizon,
+            n_rollouts=rollout_num_episodes,
+            video_path=args.video_path,
+            camera_names=args.camera_names,
+            video_target_mask_grid=args.video_target_mask_grid,
+            average=avg_rollout_stats,
+            rollouts=[
+                {k: rollout_stats[k][i] for k in rollout_stats}
+                for i in range(rollout_num_episodes)
+            ],
+        )
+        with open(stats_path, "w") as f:
+            json.dump(make_json_serializable(stats_payload), f, indent=4)
+        print("Wrote rollout stats to {}".format(stats_path))
 
 
 if __name__ == "__main__":
@@ -744,6 +804,19 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="(optional) set seed for rollouts",
+    )
+
+    parser.add_argument(
+        "--progress_interval",
+        type=int,
+        default=100,
+        help="print rollout progress every n environment steps; set <= 0 to disable step progress",
+    )
+
+    parser.add_argument(
+        "--verbose_load",
+        action="store_true",
+        help="print full checkpoint policy and environment details while loading",
     )
 
     args = parser.parse_args()
