@@ -51,13 +51,6 @@ Example usage:
         --n_rollouts 50 --horizon 400 --seed 0 \
         --dataset_path /path/to/output.hdf5
 
-    # Evaluate a masked-image Diffusion Policy with obstacle guidance.
-
-    python run_trained_agent.py --agent /path/to/model.pth \
-        --n_rollouts 50 --horizon 400 --seed 0 \
-        --obstacle_guidance --guidance_scale 0.03 \
-        --guidance_mode xyz_cylinder --xy_clearance 0.02 --z_clearance 0.03 --guidance_horizon 8 \
-        --guidance_schedule late --target_object_name Can
 """
 import argparse
 import json
@@ -69,12 +62,9 @@ from copy import deepcopy
 
 import torch
 
-import robomimic
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.tensor_utils as TensorUtils
-import robomimic.utils.obs_utils as ObsUtils
-import robomimic.utils.obstacle_guidance_utils as ObstacleGuidanceUtils
 from robomimic.envs.env_base import EnvBase
 from robomimic.envs.wrappers import EnvWrapper
 from robomimic.algo import RolloutPolicy
@@ -128,121 +118,6 @@ def make_target_mask_grid_video_frame(env, obs, camera_names, height=512, width=
     return np.concatenate(rows, axis=0)
 
 
-def get_current_eef_pos_from_obs(obs, obs_key="robot0_eef_pos"):
-    """
-    Return current eef position from a rollout observation dict.
-    """
-    if obs_key not in obs:
-        raise KeyError("Observation key '{}' is required for obstacle guidance".format(obs_key))
-    eef_pos = np.array(obs[obs_key], dtype=np.float32)
-    if eef_pos.ndim == 2:
-        eef_pos = eef_pos[-1]
-    if eef_pos.shape[-1] != 3:
-        raise ValueError("Expected '{}' to have final dimension 3, got {}".format(obs_key, eef_pos.shape))
-    return eef_pos
-
-
-def get_action_normalization_vector(policy):
-    """
-    Return flat action unnormalization scale / offset from RolloutPolicy stats.
-    """
-    stats = getattr(policy, "action_normalization_stats", None)
-    if stats is None:
-        return None, None
-    algo = getattr(policy, "policy", policy)
-    action_keys = algo.global_config.train.action_keys
-    scales = []
-    offsets = []
-    for key in action_keys:
-        scales.append(np.array(stats[key]["scale"], dtype=np.float32).reshape(-1))
-        offsets.append(np.array(stats[key]["offset"], dtype=np.float32).reshape(-1))
-    return np.concatenate(scales, axis=0), np.concatenate(offsets, axis=0)
-
-
-def set_obstacle_guidance_context(policy, env, obs, guidance_config):
-    """
-    Query oracle obstacle state from the env and pass it into the underlying
-    policy for optional inference-time guidance.
-    """
-    algo = getattr(policy, "policy", policy)
-    if not hasattr(algo, "set_obstacle_guidance_context"):
-        raise ValueError("Loaded policy does not support obstacle guidance context")
-
-    if not guidance_config.get("enabled", False):
-        algo.set_obstacle_guidance_context(None)
-        return None
-
-    current_eef_pos = get_current_eef_pos_from_obs(
-        obs=obs,
-        obs_key=guidance_config.get("eef_pos_obs_key", "robot0_eef_pos"),
-    )
-    centers_xyz, physical_radii, safety_radii, top_z, names = ObstacleGuidanceUtils.get_oracle_obstacle_geometry(
-        env=env,
-        target_object_name=guidance_config.get("target_object_name", None),
-        obstacle_names=guidance_config.get("obstacle_names", None),
-        xy_clearance=guidance_config.get("xy_clearance", 0.02),
-    )
-    delta_pos_scale, delta_pos_offset = ObstacleGuidanceUtils.get_controller_delta_pos_mapping(env)
-    action_scale, action_offset = get_action_normalization_vector(policy)
-
-    context = dict(
-        enabled=True,
-        guidance_mode=guidance_config.get("guidance_mode", "xyz_cylinder"),
-        current_eef_pos=current_eef_pos,
-        obstacle_centers_xyz=centers_xyz,
-        obstacle_physical_radii=physical_radii,
-        obstacle_radii=safety_radii,
-        obstacle_top_z=top_z,
-        xy_clearance=guidance_config.get("xy_clearance", 0.02),
-        z_clearance=guidance_config.get("z_clearance", 0.03),
-        guidance_scale=guidance_config.get("guidance_scale", 0.0),
-        guidance_horizon=guidance_config.get("guidance_horizon", 8),
-        guidance_schedule=guidance_config.get("guidance_schedule", "late"),
-        delta_pos_scale=delta_pos_scale,
-        delta_pos_offset=delta_pos_offset,
-        action_scale=action_scale,
-        action_offset=action_offset,
-        final_collision_refine=guidance_config.get("final_collision_refine", False),
-        collision_refine_steps=guidance_config.get("collision_refine_steps", 5),
-        collision_refine_scale=guidance_config.get("collision_refine_scale", 0.02),
-        final_collision_cost_threshold=guidance_config.get("final_collision_cost_threshold", 1e-8),
-    )
-    algo.set_obstacle_guidance_context(context)
-    return dict(
-        current_eef_pos=current_eef_pos,
-        guidance_mode=context["guidance_mode"],
-        obstacle_centers_xyz=centers_xyz,
-        obstacle_physical_radii=physical_radii,
-        obstacle_radii=safety_radii,
-        obstacle_top_z=top_z,
-        obstacle_names=names,
-        xy_clearance=context["xy_clearance"],
-        z_clearance=context["z_clearance"],
-        delta_pos_scale=delta_pos_scale,
-    )
-
-
-def min_eef_obstacle_xy_distance(eef_pos, obstacle_centers):
-    """
-    Compute current xy distance from eef to nearest obstacle.
-    """
-    if obstacle_centers is None or len(obstacle_centers) == 0:
-        return None
-    centers_xy = np.array(obstacle_centers)[..., :2]
-    dist = np.linalg.norm(centers_xy - np.array(eef_pos[:2])[None], axis=-1)
-    return float(np.min(dist))
-
-
-def min_eef_obstacle_z_clearance(eef_pos, obstacle_top_z, z_clearance):
-    """
-    Compute current z clearance from eef to nearest obstacle z limit.
-    """
-    if obstacle_top_z is None or len(obstacle_top_z) == 0:
-        return None
-    clearance = float(eef_pos[2]) - (np.array(obstacle_top_z, dtype=np.float32) + float(z_clearance))
-    return float(np.min(clearance))
-
-
 def rollout(
     policy,
     env,
@@ -253,7 +128,6 @@ def rollout(
     return_obs=False,
     camera_names=None,
     video_target_mask_grid=False,
-    obstacle_guidance_config=None,
     progress_prefix=None,
     progress_interval=100,
 ):
@@ -296,76 +170,12 @@ def rollout(
     if return_obs:
         # store observations too
         traj.update(dict(obs=[], next_obs=[]))
-    guidance_costs = []
-    guidance_min_distances = []
-    guidance_min_z_clearances = []
-    final_collision_costs_before = []
-    final_collision_costs_after = []
-    final_collision_free = []
-    actual_min_distances = []
-    actual_min_z_clearances = []
-    guidance_chunk_count = getattr(getattr(policy, "policy", policy), "obstacle_guidance_sample_count", 0)
-    obstacle_log_printed = False
 
     try:
         for step_i in range(horizon):
 
             # get action from policy
-            obstacle_info = None
-            if obstacle_guidance_config is not None and obstacle_guidance_config.get("enabled", False):
-                obstacle_info = set_obstacle_guidance_context(
-                    policy=policy,
-                    env=env,
-                    obs=obs,
-                    guidance_config=obstacle_guidance_config,
-                )
-                if not obstacle_log_printed:
-                    print("Obstacle guidance mode: {}".format(obstacle_info["guidance_mode"]))
-                    print("Obstacle guidance objects: {}".format(obstacle_info["obstacle_names"]))
-                    print("Obstacle guidance centers xyz: {}".format(obstacle_info["obstacle_centers_xyz"].tolist()))
-                    print("Obstacle guidance physical xy radii: {}".format(obstacle_info["obstacle_physical_radii"].tolist()))
-                    print("Obstacle guidance safety radii: {}".format(obstacle_info["obstacle_radii"].tolist()))
-                    print("Obstacle guidance top z: {}".format(obstacle_info["obstacle_top_z"].tolist()))
-                    print("Obstacle guidance xy_clearance: {}".format(obstacle_info["xy_clearance"]))
-                    print("Obstacle guidance z_clearance: {}".format(obstacle_info["z_clearance"]))
-                    print("Obstacle guidance delta_pos_scale: {}".format(obstacle_info["delta_pos_scale"].tolist()))
-                    obstacle_log_printed = True
-                actual_min_dist = min_eef_obstacle_xy_distance(
-                    eef_pos=obstacle_info["current_eef_pos"],
-                    obstacle_centers=obstacle_info["obstacle_centers_xyz"],
-                )
-                if actual_min_dist is not None:
-                    actual_min_distances.append(actual_min_dist)
-                actual_min_z_clearance = min_eef_obstacle_z_clearance(
-                    eef_pos=obstacle_info["current_eef_pos"],
-                    obstacle_top_z=obstacle_info["obstacle_top_z"],
-                    z_clearance=obstacle_info["z_clearance"],
-                )
-                if actual_min_z_clearance is not None:
-                    actual_min_z_clearances.append(actual_min_z_clearance)
             act = policy(ob=obs)
-            algo = getattr(policy, "policy", policy)
-            new_guidance_chunk_count = getattr(algo, "obstacle_guidance_sample_count", guidance_chunk_count)
-            if new_guidance_chunk_count != guidance_chunk_count:
-                guidance_info = getattr(algo, "last_obstacle_guidance_info", None)
-                if guidance_info is not None and guidance_info.get("applied", False):
-                    guidance_costs.append(guidance_info["cost"])
-                    min_xy_distance = guidance_info.get("min_xy_distance", guidance_info.get("min_distance", None))
-                    if min_xy_distance is not None:
-                        guidance_min_distances.append(float(np.min(min_xy_distance)))
-                    min_z_clearance = guidance_info.get("min_z_clearance", None)
-                    if min_z_clearance is not None:
-                        guidance_min_z_clearances.append(float(np.min(min_z_clearance)))
-                    final_cost_before = guidance_info.get("final_collision_cost_before", None)
-                    if final_cost_before is not None:
-                        final_collision_costs_before.append(float(final_cost_before))
-                    final_cost_after = guidance_info.get("final_collision_cost_after", None)
-                    if final_cost_after is not None:
-                        final_collision_costs_after.append(float(final_cost_after))
-                    final_is_free = guidance_info.get("final_collision_free", None)
-                    if final_is_free is not None:
-                        final_collision_free.append(float(final_is_free))
-                guidance_chunk_count = new_guidance_chunk_count
 
             # play action
             next_obs, r, done, _ = env.step(act)
@@ -424,31 +234,6 @@ def rollout(
         print("WARNING: got rollout exception {}".format(e))
 
     stats = dict(Return=total_reward, Horizon=(step_i + 1), Success_Rate=float(success))
-    if obstacle_guidance_config is not None and obstacle_guidance_config.get("enabled", False):
-        stats["Obstacle_Guidance_Applied"] = float(len(guidance_costs) > 0)
-        stats["Obstacle_Guidance_Cost"] = float(np.mean(guidance_costs)) if len(guidance_costs) > 0 else 0.0
-        stats["Obstacle_Guidance_Min_Distance"] = (
-            float(np.min(guidance_min_distances)) if len(guidance_min_distances) > 0 else 0.0
-        )
-        stats["Obstacle_Guidance_Min_XY_Distance"] = stats["Obstacle_Guidance_Min_Distance"]
-        stats["Obstacle_Guidance_Min_Z_Clearance"] = (
-            float(np.min(guidance_min_z_clearances)) if len(guidance_min_z_clearances) > 0 else 0.0
-        )
-        stats["Final_Collision_Cost_Before_Refine"] = (
-            float(np.mean(final_collision_costs_before)) if len(final_collision_costs_before) > 0 else 0.0
-        )
-        stats["Final_Collision_Cost_After_Refine"] = (
-            float(np.mean(final_collision_costs_after)) if len(final_collision_costs_after) > 0 else 0.0
-        )
-        stats["Final_Collision_Free_Rate"] = (
-            float(np.mean(final_collision_free)) if len(final_collision_free) > 0 else 0.0
-        )
-        stats["Actual_Min_Eef_Obstacle_Distance"] = (
-            float(np.min(actual_min_distances)) if len(actual_min_distances) > 0 else 0.0
-        )
-        stats["Actual_Min_Eef_Obstacle_Z_Clearance"] = (
-            float(np.min(actual_min_z_clearances)) if len(actual_min_z_clearances) > 0 else 0.0
-        )
 
     if return_obs:
         # convert list of dict to dict of list for obs dictionaries (for convenient writes to hdf5 dataset)
@@ -477,22 +262,6 @@ def run_trained_agent(args):
         assert len(args.camera_names) == 1
     if args.video_target_mask_grid and args.camera_names == ["agentview"]:
         args.camera_names = ["agentview", "robot0_eye_in_hand"]
-    obstacle_guidance_config = dict(
-        enabled=args.obstacle_guidance,
-        guidance_mode=args.guidance_mode,
-        guidance_scale=args.guidance_scale,
-        xy_clearance=args.xy_clearance,
-        z_clearance=args.z_clearance,
-        guidance_horizon=args.guidance_horizon,
-        guidance_schedule=args.guidance_schedule,
-        target_object_name=args.target_object_name,
-        obstacle_names=args.obstacle_names,
-        eef_pos_obs_key=args.eef_pos_obs_key,
-        final_collision_refine=args.final_collision_refine,
-        collision_refine_steps=args.collision_refine_steps,
-        collision_refine_scale=args.collision_refine_scale,
-        final_collision_cost_threshold=args.final_collision_cost_threshold,
-    )
 
     # relative path to agent
     ckpt_path = args.agent
@@ -551,7 +320,6 @@ def run_trained_agent(args):
             return_obs=(write_dataset and args.dataset_obs),
             camera_names=args.camera_names,
             video_target_mask_grid=args.video_target_mask_grid,
-            obstacle_guidance_config=obstacle_guidance_config,
             progress_prefix=progress_prefix,
             progress_interval=args.progress_interval,
         )
@@ -694,92 +462,6 @@ if __name__ == "__main__":
         "--video_target_mask_grid",
         action="store_true",
         help="render a 2-column video per camera: original RGB on the left and policy image observation on the right",
-    )
-
-    parser.add_argument(
-        "--obstacle_guidance",
-        action="store_true",
-        help="enable inference-time obstacle guidance for diffusion policy sampling",
-    )
-    parser.add_argument(
-        "--guidance_scale",
-        type=float,
-        default=0.03,
-        help="obstacle guidance gradient step scale",
-    )
-    parser.add_argument(
-        "--guidance_mode",
-        type=str,
-        choices=["xy", "xyz_cylinder"],
-        default="xyz_cylinder",
-        help="obstacle guidance cost mode",
-    )
-    parser.add_argument(
-        "--xy_clearance",
-        type=float,
-        default=0.02,
-        help="xy safety margin added to simulator-derived obstacle radius in meters",
-    )
-    parser.add_argument(
-        "--z_clearance",
-        type=float,
-        default=0.03,
-        help="minimum eef clearance above obstacle top z in meters for xyz_cylinder guidance",
-    )
-    parser.add_argument(
-        "--guidance_horizon",
-        type=int,
-        default=8,
-        help="number of predicted action steps used in obstacle cost",
-    )
-    parser.add_argument(
-        "--guidance_schedule",
-        type=str,
-        choices=["constant", "late"],
-        default="late",
-        help="guidance scale schedule over denoising steps",
-    )
-    parser.add_argument(
-        "--final_collision_refine",
-        action="store_true",
-        help="repair the final executable action chunk with post-hoc obstacle-cost gradient steps",
-    )
-    parser.add_argument(
-        "--collision_refine_steps",
-        type=int,
-        default=5,
-        help="maximum number of post-hoc collision refinement gradient steps",
-    )
-    parser.add_argument(
-        "--collision_refine_scale",
-        type=float,
-        default=0.02,
-        help="normalized gradient step scale for post-hoc collision refinement",
-    )
-    parser.add_argument(
-        "--final_collision_cost_threshold",
-        type=float,
-        default=1e-8,
-        help="surrogate obstacle cost threshold considered collision-free after final refinement",
-    )
-    parser.add_argument(
-        "--target_object_name",
-        type=str,
-        default="Can",
-        help="object name to exclude from obstacle guidance",
-    )
-    parser.add_argument(
-        "--obstacle_names",
-        type=str,
-        nargs="*",
-        default=None,
-        help="optional explicit obstacle object names; defaults to all non-target objects",
-    )
-    parser.add_argument(
-        "--eef_pos_obs_key",
-        type=str,
-        default="robot0_eef_pos",
-        help="observation key used for current end-effector position",
     )
 
     # If provided, an hdf5 file will be written with the rollout data

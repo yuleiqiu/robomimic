@@ -290,6 +290,11 @@ class DiffusionPolicyUNet(PolicyAlgo):
             return False
         if not context.get("enabled", False):
             return False
+        if context.get("geometry_source", "oracle_center") == "pointcloud":
+            points = context.get("obstacle_points_world", None)
+            if points is None or len(points) == 0:
+                return False
+            return context.get("guidance_scale", 0.0) > 0.0
         centers = context.get("obstacle_centers_xyz", context.get("obstacle_centers_xy", None))
         radii = context.get("obstacle_radii", None)
         if centers is None or radii is None:
@@ -306,11 +311,26 @@ class DiffusionPolicyUNet(PolicyAlgo):
         if horizon is None:
             horizon = context.get("guidance_horizon", self.algo_config.horizon.action_horizon)
         guidance_mode = context.get("guidance_mode", "xyz_cylinder")
+        geometry_source = context.get("geometry_source", "oracle_center")
         action_for_cost = ObstacleGuidanceUtils.unnormalize_action_chunk(
             action_chunk=action_chunk,
             action_scale=context.get("action_scale", None),
             action_offset=context.get("action_offset", None),
         )
+        if geometry_source == "pointcloud":
+            return ObstacleGuidanceUtils.obstacle_pointcloud_cost(
+                action_chunk=action_for_cost,
+                current_eef_pos=context["current_eef_pos"],
+                obstacle_points_world=context["obstacle_points_world"],
+                safe_distance=context.get("pc_safe_distance", context.get("safe_distance", 0.02)),
+                distance_mode=context.get("pc_distance_mode", context.get("distance_mode", "xy")),
+                horizon=horizon,
+                delta_pos_scale=context.get("delta_pos_scale", 1.0),
+                delta_pos_offset=context.get("delta_pos_offset", 0.0),
+                return_stats=return_stats,
+            )
+        if geometry_source != "oracle_center":
+            raise ValueError("Unsupported obstacle geometry_source '{}'".format(geometry_source))
         if guidance_mode == "xy":
             return ObstacleGuidanceUtils.obstacle_xy_cost(
                 action_chunk=action_for_cost,
@@ -394,18 +414,26 @@ class DiffusionPolicyUNet(PolicyAlgo):
             grad_source=naction_in,
         )
 
-        min_xy_distance = cost_stats["min_xy_distance"]
+        min_distance = cost_stats.get("min_distance", None)
+        min_xy_distance = cost_stats.get("min_xy_distance", None)
+        display_distance = min_xy_distance if min_xy_distance is not None else min_distance
         min_z_clearance = cost_stats.get("min_z_clearance", None)
+        min_pointcloud_distance = cost_stats.get("min_pointcloud_distance", None)
         self.last_obstacle_guidance_info = dict(
             applied=True,
             guidance_mode=guidance_mode,
+            geometry_source=context.get("geometry_source", "oracle_center"),
             rho_t=float(rho_t),
             cost=float(cost.detach().cpu().item()),
-            min_distance=None if min_xy_distance is None else TensorUtils.to_numpy(min_xy_distance),
+            min_distance=None if display_distance is None else TensorUtils.to_numpy(display_distance),
             min_xy_distance=None if min_xy_distance is None else TensorUtils.to_numpy(min_xy_distance),
+            min_pointcloud_distance=(
+                None if min_pointcloud_distance is None else TensorUtils.to_numpy(min_pointcloud_distance)
+            ),
             min_z_clearance=None if min_z_clearance is None else TensorUtils.to_numpy(min_z_clearance),
             grad_norm=None if grad_norm is None else TensorUtils.to_numpy(grad_norm),
             num_obstacles=int(cost_stats["num_obstacles"]),
+            num_points=int(cost_stats.get("num_points", 0)),
             obstacle_top_z=context.get("obstacle_top_z", None),
             z_clearance=context.get("z_clearance", None),
             delta_pos_scale=context.get("delta_pos_scale", None),
@@ -456,7 +484,10 @@ class DiffusionPolicyUNet(PolicyAlgo):
             refined = torch.clamp(refined, -1.0, 1.0)
             steps_taken += 1
 
-        min_xy_distance = final_stats["min_xy_distance"] if final_stats is not None else None
+        min_xy_distance = None if final_stats is None else final_stats.get("min_xy_distance", None)
+        min_distance = None if final_stats is None else final_stats.get("min_distance", None)
+        display_distance = min_xy_distance if min_xy_distance is not None else min_distance
+        min_pointcloud_distance = None if final_stats is None else final_stats.get("min_pointcloud_distance", None)
         min_z_clearance = None if final_stats is None else final_stats.get("min_z_clearance", None)
         self._update_last_obstacle_guidance_info(dict(
             applied=True,
@@ -467,7 +498,11 @@ class DiffusionPolicyUNet(PolicyAlgo):
             final_collision_threshold=float(threshold),
             collision_refine_steps=steps_taken,
             collision_refine_grad_norm=None if last_grad_norm is None else TensorUtils.to_numpy(last_grad_norm),
+            final_min_distance=None if display_distance is None else TensorUtils.to_numpy(display_distance),
             final_min_xy_distance=None if min_xy_distance is None else TensorUtils.to_numpy(min_xy_distance),
+            final_min_pointcloud_distance=(
+                None if min_pointcloud_distance is None else TensorUtils.to_numpy(min_pointcloud_distance)
+            ),
             final_min_z_clearance=None if min_z_clearance is None else TensorUtils.to_numpy(min_z_clearance),
         ))
         return refined.detach()

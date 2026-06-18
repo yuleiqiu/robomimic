@@ -133,6 +133,15 @@ def _sim_geom_id(sim, geom_name):
         return None
 
 
+def _object_geom_ids(sim, obj):
+    geom_ids = []
+    for geom_name in _object_geom_names(obj):
+        geom_id = _sim_geom_id(sim, geom_name)
+        if geom_id is not None:
+            geom_ids.append(geom_id)
+    return sorted(set(geom_ids))
+
+
 def _geom_xy_radius_and_z_extent(sim, geom_id):
     """
     Estimate an axis-aligned XY enclosing radius and positive Z extent for a geom.
@@ -281,6 +290,209 @@ def get_oracle_obstacle_geometry(
         np.array(top_z, dtype=np.float32),
         names,
     )
+
+
+def get_obstacle_geom_ids(
+    env,
+    target_object_name=None,
+    obstacle_names=None,
+):
+    """
+    Return MuJoCo geom ids for obstacle objects. This uses object identity only
+    for oracle segmentation masks; pose and geometry are not used for guidance.
+
+    Returns:
+        geom_ids (list): sorted MuJoCo geom ids for obstacle visual/contact geoms.
+        names (list): obstacle object names in the same order as iteration.
+    """
+    raw_env = get_raw_env(env)
+    sim = getattr(raw_env, "sim", None)
+    if sim is None:
+        raise ValueError("Obstacle mask rendering requires simulator access")
+
+    geom_ids = []
+    names = []
+    for obj, name in _iter_obstacle_objects(
+        raw_env=raw_env,
+        target_object_name=target_object_name,
+        obstacle_names=obstacle_names,
+    ):
+        obj_geom_ids = _object_geom_ids(sim=sim, obj=obj)
+        if len(obj_geom_ids) == 0:
+            continue
+        geom_ids.extend(obj_geom_ids)
+        names.append(name)
+    return sorted(set(geom_ids)), names
+
+
+def render_obstacle_mask(
+    env,
+    camera_name,
+    height,
+    width,
+    target_object_name=None,
+    obstacle_names=None,
+    obstacle_geom_ids=None,
+    flip=True,
+):
+    """
+    Render a boolean mask for obstacle objects from MuJoCo segmentation ids.
+
+    Returns:
+        mask (np.ndarray): shape [H, W], dtype bool.
+        names (list): obstacle object names used for the mask.
+    """
+    raw_env = get_raw_env(env)
+    if obstacle_geom_ids is None:
+        obstacle_geom_ids, names = get_obstacle_geom_ids(
+            env=env,
+            target_object_name=target_object_name,
+            obstacle_names=obstacle_names,
+        )
+    else:
+        names = []
+
+    if len(obstacle_geom_ids) == 0:
+        return np.zeros((height, width), dtype=bool), names
+
+    seg = raw_env.sim.render(
+        camera_name=camera_name,
+        width=width,
+        height=height,
+        depth=False,
+        segmentation=True,
+    )
+    geom_ids = seg[:, :, 1]
+    if flip:
+        geom_ids = geom_ids[::-1]
+    return np.isin(geom_ids, np.array(obstacle_geom_ids, dtype=geom_ids.dtype)), names
+
+
+def depth_mask_to_world_pointcloud(
+    depth,
+    mask,
+    intrinsics,
+    camera_to_world,
+    near=None,
+    far=None,
+    workspace_bounds=None,
+    voxel_size=None,
+    max_points=None,
+    return_camera_points=False,
+    device=None,
+):
+    """
+    Back-project a masked metric depth image into a world-frame point cloud.
+
+    Args:
+        depth (array or Tensor): shape [H, W] or [H, W, 1], metric depth in metres.
+        mask (array or Tensor): shape [H, W] or [H, W, C], nonzero for obstacle pixels.
+        intrinsics (array or Tensor): shape [3, 3].
+        camera_to_world (array or Tensor): shape [4, 4].
+        near (float or None): optional minimum valid metric depth.
+        far (float or None): optional maximum valid metric depth.
+        workspace_bounds (array-like or None): optional [[xmin,ymin,zmin],[xmax,ymax,zmax]] crop.
+        voxel_size (float or None): optional approximate voxel downsample size in metres.
+        max_points (int or None): optional deterministic cap on returned point count.
+        return_camera_points (bool): if True, also return camera-frame points before filtering cap.
+
+    Returns:
+        points_world (Tensor): shape [N, 3], detached, unit metres.
+        stats (OrderedDict): point-count diagnostics.
+        points_camera (Tensor, optional): shape [M, 3], detached.
+    """
+    depth_t = torch.as_tensor(depth, dtype=torch.float32, device=device)
+    if depth_t.ndim == 3:
+        depth_t = depth_t[..., 0]
+    if depth_t.ndim != 2:
+        raise ValueError("depth must have shape [H, W] or [H, W, 1], got {}".format(tuple(depth_t.shape)))
+
+    mask_t = torch.as_tensor(mask, device=depth_t.device)
+    if mask_t.ndim == 3:
+        mask_t = torch.any(mask_t != 0, dim=-1)
+    else:
+        mask_t = mask_t != 0
+    if mask_t.shape != depth_t.shape:
+        raise ValueError("mask shape {} must match depth shape {}".format(tuple(mask_t.shape), tuple(depth_t.shape)))
+
+    valid = mask_t & torch.isfinite(depth_t) & (depth_t > 0.0)
+    if near is not None:
+        valid = valid & (depth_t > float(near))
+    if far is not None:
+        valid = valid & (depth_t < float(far))
+
+    raw_point_count = int(torch.count_nonzero(mask_t).detach().cpu().item())
+    valid_point_count = int(torch.count_nonzero(valid).detach().cpu().item())
+    stats = OrderedDict(
+        raw_point_count=raw_point_count,
+        valid_point_count=valid_point_count,
+        cropped_point_count=0,
+        voxel_point_count=0,
+        point_count=0,
+    )
+    if valid_point_count == 0:
+        empty = torch.zeros((0, 3), dtype=depth_t.dtype, device=depth_t.device)
+        stats["cropped_point_count"] = 0
+        stats["voxel_point_count"] = 0
+        if return_camera_points:
+            return empty.detach(), stats, empty.detach()
+        return empty.detach(), stats
+
+    ys, xs = torch.nonzero(valid, as_tuple=True)
+    z = depth_t[ys, xs]
+    K = torch.as_tensor(intrinsics, dtype=depth_t.dtype, device=depth_t.device)
+    T_wc = torch.as_tensor(camera_to_world, dtype=depth_t.dtype, device=depth_t.device)
+
+    fx = K[0, 0]
+    fy = K[1, 1]
+    cx = K[0, 2]
+    cy = K[1, 2]
+    x = (xs.to(depth_t.dtype) - cx) * z / fx
+    y = (ys.to(depth_t.dtype) - cy) * z / fy
+    points_camera = torch.stack((x, y, z), dim=-1)
+
+    ones = torch.ones((points_camera.shape[0], 1), dtype=depth_t.dtype, device=depth_t.device)
+    points_h = torch.cat((points_camera, ones), dim=-1)
+    points_world = (T_wc @ points_h.T).T[:, :3]
+
+    if workspace_bounds is not None:
+        bounds = torch.as_tensor(workspace_bounds, dtype=depth_t.dtype, device=depth_t.device)
+        if bounds.shape != (2, 3):
+            raise ValueError("workspace_bounds must have shape [2, 3], got {}".format(tuple(bounds.shape)))
+        in_bounds = torch.all((points_world >= bounds[0]) & (points_world <= bounds[1]), dim=-1)
+        points_world = points_world[in_bounds]
+        points_camera = points_camera[in_bounds]
+
+    stats["cropped_point_count"] = int(points_world.shape[0])
+
+    if voxel_size is not None and float(voxel_size) > 0.0 and points_world.shape[0] > 0:
+        voxels = torch.floor(points_world / float(voxel_size)).to(torch.int64)
+        voxels = voxels - torch.amin(voxels, dim=0, keepdim=True)
+        ranges = torch.amax(voxels, dim=0) + 1
+        voxel_hash = voxels[:, 0] * ranges[1] * ranges[2] + voxels[:, 1] * ranges[2] + voxels[:, 2]
+        sorted_hash, order = torch.sort(voxel_hash)
+        keep = torch.ones_like(sorted_hash, dtype=torch.bool)
+        keep[1:] = sorted_hash[1:] != sorted_hash[:-1]
+        unique_indices = torch.sort(order[keep]).values
+        points_world = points_world[unique_indices]
+        points_camera = points_camera[unique_indices]
+
+    stats["voxel_point_count"] = int(points_world.shape[0])
+
+    if max_points is not None and int(max_points) > 0 and points_world.shape[0] > int(max_points):
+        idx = torch.linspace(
+            0,
+            points_world.shape[0] - 1,
+            steps=int(max_points),
+            device=points_world.device,
+        ).long()
+        points_world = points_world[idx]
+        points_camera = points_camera[idx]
+
+    stats["point_count"] = int(points_world.shape[0])
+    if return_camera_points:
+        return points_world.detach(), stats, points_camera.detach()
+    return points_world.detach(), stats
 
 
 def get_oracle_obstacle_circles(
@@ -586,6 +798,87 @@ def obstacle_xyz_cylinder_cost(
         min_xy_distance=min_xy_distance,
         min_z_clearance=min_z_clearance,
         num_obstacles=centers.shape[0],
+    )
+    return (cost, stats) if return_stats else cost
+
+
+def obstacle_pointcloud_cost(
+    action_chunk,
+    current_eef_pos,
+    obstacle_points_world,
+    safe_distance=0.02,
+    distance_mode="xy",
+    horizon=8,
+    delta_pos_scale=1.0,
+    delta_pos_offset=0.0,
+    return_stats=False,
+):
+    """
+    Differentiable EEF point-to-obstacle-pointcloud penetration cost.
+
+    Args:
+        action_chunk (torch.Tensor): shape [B, H, A].
+        current_eef_pos (torch.Tensor or np.ndarray): shape [B, 3] or [3].
+        obstacle_points_world (torch.Tensor or np.ndarray): shape [N, 3].
+        safe_distance (float): minimum allowed distance in metres.
+        distance_mode (str): either "xy" or "xyz".
+    """
+    points = _as_batched_tensor(
+        obstacle_points_world,
+        device=action_chunk.device,
+        dtype=action_chunk.dtype,
+    )
+    if points is None or points.numel() == 0:
+        cost = action_chunk.sum() * 0.0
+        stats = OrderedDict(
+            cost=cost.detach(),
+            per_batch_cost=torch.zeros(
+                (action_chunk.shape[0],),
+                dtype=action_chunk.dtype,
+                device=action_chunk.device,
+            ),
+            min_distance=None,
+            min_xy_distance=None,
+            num_obstacles=0,
+            num_points=0,
+        )
+        return (cost, stats) if return_stats else cost
+
+    if points.ndim != 2 or points.shape[-1] != 3:
+        raise ValueError("obstacle_points_world must have shape [N, 3], got {}".format(tuple(points.shape)))
+
+    traj = action_chunk_to_eef_xyz_traj(
+        action_chunk=action_chunk,
+        current_eef_pos=current_eef_pos,
+        horizon=horizon,
+        delta_pos_scale=delta_pos_scale,
+        delta_pos_offset=delta_pos_offset,
+    )
+
+    if distance_mode == "xy":
+        traj_for_dist = traj[..., :2]
+        points_for_dist = points[..., :2]
+    elif distance_mode == "xyz":
+        traj_for_dist = traj
+        points_for_dist = points
+    else:
+        raise ValueError("Unsupported pointcloud distance_mode '{}'".format(distance_mode))
+
+    dist = torch.cdist(traj_for_dist, points_for_dist.unsqueeze(0).expand(traj.shape[0], -1, -1))
+    nearest_dist = torch.amin(dist, dim=-1)
+    penetration = F.relu(float(safe_distance) - nearest_dist)
+    per_batch_cost = torch.sum(penetration ** 2, dim=1)
+    cost = torch.sum(per_batch_cost)
+    min_distance = torch.amin(nearest_dist, dim=1).detach()
+
+    stats = OrderedDict(
+        cost=cost.detach(),
+        per_batch_cost=per_batch_cost.detach(),
+        min_distance=min_distance,
+        min_xy_distance=min_distance if distance_mode == "xy" else None,
+        min_pointcloud_distance=min_distance,
+        num_obstacles=int(points.shape[0]),
+        num_points=int(points.shape[0]),
     )
     return (cost, stats) if return_stats else cost
 
