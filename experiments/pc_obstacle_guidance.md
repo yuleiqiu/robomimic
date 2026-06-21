@@ -55,3 +55,6 @@ robomimic/scripts/run_obstacle_guided_agent.py
 ```
 
 The current guidance work adds pointcloud obstacle geometry support in addition to oracle-center guidance. The intended next comparison is to rerun the same 4 environments x 3 seeds setup with guidance enabled, then compare success rate, average horizon, and guidance/collision diagnostics against the baseline above.
+
+Metric definitions for obstacle-guided rollouts are documented in
+`experiments/obstacle_guided_metrics.md`.

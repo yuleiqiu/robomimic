@@ -186,6 +186,13 @@ def _object_center_from_sim(sim, obj):
     return pos
 
 
+def _object_is_active_in_scene(sim, obj):
+    center = _object_center_from_sim(sim, obj)
+    if center is None:
+        return True
+    return bool(np.all(np.isfinite(center)) and np.max(np.abs(center)) < 5.0)
+
+
 def _object_geometry_from_sim(sim, obj, xy_clearance=0.0):
     center = _object_center_from_sim(sim, obj)
     if center is None:
@@ -263,6 +270,8 @@ def get_oracle_obstacle_geometry(
         target_object_name=target_object_name,
         obstacle_names=obstacle_names,
     ):
+        if not _object_is_active_in_scene(sim=sim, obj=obj):
+            continue
         center, physical_radius, safety_radius, object_top_z = _object_geometry_from_sim(
             sim=sim,
             obj=obj,
@@ -317,12 +326,75 @@ def get_obstacle_geom_ids(
         target_object_name=target_object_name,
         obstacle_names=obstacle_names,
     ):
+        if not _object_is_active_in_scene(sim=sim, obj=obj):
+            continue
         obj_geom_ids = _object_geom_ids(sim=sim, obj=obj)
         if len(obj_geom_ids) == 0:
             continue
         geom_ids.extend(obj_geom_ids)
         names.append(name)
     return sorted(set(geom_ids)), names
+
+
+def get_obstacle_contact_geom_ids_by_name(
+    env,
+    target_object_name=None,
+    obstacle_names=None,
+):
+    """
+    Return contact geom ids grouped by active non-target object name.
+    """
+    raw_env = get_raw_env(env)
+    sim = getattr(raw_env, "sim", None)
+    if sim is None:
+        raise ValueError("Obstacle contact tracking requires simulator access")
+
+    geom_ids_by_name = OrderedDict()
+    for obj, name in _iter_obstacle_objects(
+        raw_env=raw_env,
+        target_object_name=target_object_name,
+        obstacle_names=obstacle_names,
+    ):
+        if not _object_is_active_in_scene(sim=sim, obj=obj):
+            continue
+        geom_ids = []
+        for geom_name in getattr(obj, "contact_geoms", []):
+            geom_id = _sim_geom_id(sim, geom_name)
+            if geom_id is not None:
+                geom_ids.append(geom_id)
+        if len(geom_ids) > 0:
+            geom_ids_by_name[name] = sorted(set(geom_ids))
+    return geom_ids_by_name
+
+
+def get_robot_contact_geom_ids(env):
+    """
+    Return contact geom ids for robot arm and gripper collision geoms.
+    """
+    raw_env = get_raw_env(env)
+    sim = getattr(raw_env, "sim", None)
+    if sim is None:
+        raise ValueError("Robot contact tracking requires simulator access")
+
+    geom_names = []
+    for robot in getattr(raw_env, "robots", []):
+        robot_model = getattr(robot, "robot_model", None)
+        if robot_model is not None:
+            geom_names.extend(getattr(robot_model, "contact_geoms", []))
+
+        gripper = getattr(robot, "gripper", None)
+        grippers = gripper.values() if isinstance(gripper, dict) else [gripper]
+        for grip in grippers:
+            if grip is None:
+                continue
+            geom_names.extend(getattr(grip, "contact_geoms", []))
+
+    geom_ids = []
+    for geom_name in geom_names:
+        geom_id = _sim_geom_id(sim, geom_name)
+        if geom_id is not None:
+            geom_ids.append(geom_id)
+    return sorted(set(geom_ids))
 
 
 def render_obstacle_mask(

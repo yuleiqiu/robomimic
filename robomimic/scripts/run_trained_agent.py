@@ -55,6 +55,8 @@ Example usage:
 import argparse
 import json
 import os
+import shlex
+import sys
 import h5py
 import imageio
 import numpy as np
@@ -63,6 +65,7 @@ from copy import deepcopy
 import torch
 
 import robomimic.utils.file_utils as FileUtils
+import robomimic.utils.obstacle_guidance_utils as ObstacleGuidanceUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.tensor_utils as TensorUtils
 from robomimic.envs.env_base import EnvBase
@@ -83,6 +86,77 @@ def make_json_serializable(x):
     if isinstance(x, list):
         return [make_json_serializable(v) for v in x]
     return x
+
+
+def is_scalar_number(x):
+    return isinstance(x, (int, float, np.integer, np.floating, bool, np.bool_))
+
+
+def command_output_dir(args):
+    for path in (args.stats_path, args.video_path, args.dataset_path):
+        if path is not None:
+            dirname = os.path.dirname(path)
+            if dirname:
+                return dirname
+    return None
+
+
+def write_command_file(args):
+    output_dir = command_output_dir(args)
+    if output_dir is None:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    command = shlex.join([sys.executable] + sys.argv)
+    if "MUJOCO_GL" in os.environ:
+        command = "MUJOCO_GL={} {}".format(shlex.quote(os.environ["MUJOCO_GL"]), command)
+    path = os.path.join(output_dir, "command.txt")
+    with open(path, "w") as f:
+        f.write(command)
+        f.write("\n")
+    print("Wrote rollout command to {}".format(path))
+
+
+def make_non_target_collision_tracker(env, target_object_name="Can", obstacle_names=None):
+    raw_env = ObstacleGuidanceUtils.get_raw_env(env)
+    robot_geom_ids = set(ObstacleGuidanceUtils.get_robot_contact_geom_ids(env))
+    object_geom_ids_by_name = ObstacleGuidanceUtils.get_obstacle_contact_geom_ids_by_name(
+        env=env,
+        target_object_name=target_object_name,
+        obstacle_names=obstacle_names,
+    )
+    object_name_by_geom_id = {}
+    for obj_name, geom_ids in object_geom_ids_by_name.items():
+        for geom_id in geom_ids:
+            object_name_by_geom_id[geom_id] = obj_name
+    return dict(
+        raw_env=raw_env,
+        robot_geom_ids=robot_geom_ids,
+        object_name_by_geom_id=object_name_by_geom_id,
+        object_counts={name: 0 for name in object_geom_ids_by_name},
+    )
+
+
+def update_non_target_collision_counts(collision_tracker):
+    raw_env = collision_tracker["raw_env"]
+    sim = getattr(raw_env, "sim", None)
+    if sim is None:
+        return False
+
+    robot_geom_ids = collision_tracker["robot_geom_ids"]
+    object_name_by_geom_id = collision_tracker["object_name_by_geom_id"]
+    touched_objects = set()
+    for contact_i in range(sim.data.ncon):
+        contact = sim.data.contact[contact_i]
+        geom1 = int(contact.geom1)
+        geom2 = int(contact.geom2)
+        if geom1 in robot_geom_ids and geom2 in object_name_by_geom_id:
+            touched_objects.add(object_name_by_geom_id[geom2])
+        elif geom2 in robot_geom_ids and geom1 in object_name_by_geom_id:
+            touched_objects.add(object_name_by_geom_id[geom1])
+
+    for obj_name in touched_objects:
+        collision_tracker["object_counts"][obj_name] += 1
+    return len(touched_objects) > 0
 
 
 def resize_nearest(image, height, width):
@@ -130,6 +204,8 @@ def rollout(
     video_target_mask_grid=False,
     progress_prefix=None,
     progress_interval=100,
+    target_object_name="Can",
+    obstacle_names=None,
 ):
     """
     Helper function to carry out rollouts. Supports on-screen rendering, off-screen rendering to a video, 
@@ -166,6 +242,12 @@ def rollout(
     results = {}
     video_count = 0  # video frame counter
     total_reward = 0.
+    non_target_collision_step_count = 0
+    collision_tracker = make_non_target_collision_tracker(
+        env=env,
+        target_object_name=target_object_name,
+        obstacle_names=obstacle_names,
+    )
     traj = dict(actions=[], rewards=[], dones=[], states=[], initial_state_dict=state_dict)
     if return_obs:
         # store observations too
@@ -183,6 +265,8 @@ def rollout(
             # compute reward
             total_reward += r
             success = env.is_success()["task"]
+            if update_non_target_collision_counts(collision_tracker):
+                non_target_collision_step_count += 1
 
             # visualization
             if render:
@@ -233,7 +317,28 @@ def rollout(
     except env.rollout_exceptions as e:
         print("WARNING: got rollout exception {}".format(e))
 
-    stats = dict(Return=total_reward, Horizon=(step_i + 1), Success_Rate=float(success))
+    rollout_horizon = step_i + 1
+    non_target_collision_count = int(sum(collision_tracker["object_counts"].values()))
+    stats = dict(
+        Return=total_reward,
+        Horizon=rollout_horizon,
+        Success_Rate=float(success),
+        Obstacle_Guidance_Cost=None,
+        Obstacle_Guidance_Min_Distance=None,
+        Obstacle_Guidance_Trigger_Count=None,
+        Obstacle_Guidance_Trigger_Rate=None,
+        Obstacle_Guidance_Positive_Cost_Count=None,
+        Obstacle_Guidance_Positive_Cost_Rate=None,
+        Non_Target_Collision_Count=float(non_target_collision_count),
+        Non_Target_Collision_Step_Count=float(non_target_collision_step_count),
+        Non_Target_Collision_Rate=float(non_target_collision_step_count / max(rollout_horizon, 1)),
+        Non_Target_Collision_Any=float(non_target_collision_step_count > 0),
+        Non_Target_Collision_Object_Counts={
+            obj_name: int(count) for obj_name, count in collision_tracker["object_counts"].items()
+        },
+        Pointcloud_Total_Point_Count=None,
+        Pointcloud_Point_Count=None,
+    )
 
     if return_obs:
         # convert list of dict to dict of list for obs dictionaries (for convenient writes to hdf5 dataset)
@@ -262,6 +367,7 @@ def run_trained_agent(args):
         assert len(args.camera_names) == 1
     if args.video_target_mask_grid and args.camera_names == ["agentview"]:
         args.camera_names = ["agentview", "robot0_eye_in_hand"]
+    write_command_file(args)
 
     # relative path to agent
     ckpt_path = args.agent
@@ -297,11 +403,17 @@ def run_trained_agent(args):
     # maybe create video writer
     video_writer = None
     if write_video:
+        video_dir = os.path.dirname(args.video_path)
+        if video_dir:
+            os.makedirs(video_dir, exist_ok=True)
         video_writer = imageio.get_writer(args.video_path, fps=20)
 
     # maybe open hdf5 to write rollouts
     write_dataset = (args.dataset_path is not None)
     if write_dataset:
+        dataset_dir = os.path.dirname(args.dataset_path)
+        if dataset_dir:
+            os.makedirs(dataset_dir, exist_ok=True)
         data_writer = h5py.File(args.dataset_path, "w")
         data_grp = data_writer.create_group("data")
         total_samples = 0
@@ -322,6 +434,8 @@ def run_trained_agent(args):
             video_target_mask_grid=args.video_target_mask_grid,
             progress_prefix=progress_prefix,
             progress_interval=args.progress_interval,
+            target_object_name=args.target_object_name,
+            obstacle_names=args.obstacle_names,
         )
         rollout_stats.append(stats)
         print(
@@ -352,11 +466,42 @@ def run_trained_agent(args):
             ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0] # number of transitions in this episode
             total_samples += traj["actions"].shape[0]
 
-    rollout_stats = TensorUtils.list_of_flat_dict_to_dict_of_list(rollout_stats)
-    avg_rollout_stats = { k : np.mean(rollout_stats[k]) for k in rollout_stats }
-    avg_rollout_stats["Num_Success"] = np.sum(rollout_stats["Success_Rate"])
+    per_rollout_stats = rollout_stats
+    scalar_keys = [
+        k for k, v in per_rollout_stats[0].items()
+        if is_scalar_number(v)
+    ]
+    rollout_stats_by_key = {
+        k: [float(stats[k]) for stats in per_rollout_stats]
+        for k in scalar_keys
+    }
+    avg_rollout_stats = {k: float(np.mean(rollout_stats_by_key[k])) for k in rollout_stats_by_key}
+    avg_rollout_stats["Num_Success"] = float(np.sum(rollout_stats_by_key["Success_Rate"]))
+    if "Non_Target_Collision_Any" in rollout_stats_by_key:
+        avg_rollout_stats["Num_Non_Target_Collision_Rollouts"] = float(
+            np.sum(rollout_stats_by_key["Non_Target_Collision_Any"])
+        )
+    avg_rollout_stats.update(
+        Obstacle_Guidance_Cost=None,
+        Obstacle_Guidance_Min_Distance=None,
+        Obstacle_Guidance_Trigger_Count=None,
+        Obstacle_Guidance_Trigger_Rate=None,
+        Obstacle_Guidance_Positive_Cost_Count=None,
+        Obstacle_Guidance_Positive_Cost_Rate=None,
+        Pointcloud_Total_Point_Count=None,
+        Pointcloud_Point_Count=None,
+    )
+
+    total_collision_counts = {}
+    for stats in per_rollout_stats:
+        for obj_name, count in stats.get("Non_Target_Collision_Object_Counts", {}).items():
+            total_collision_counts[obj_name] = total_collision_counts.get(obj_name, 0) + int(count)
+    avg_collision_counts = {
+        obj_name: float(count / max(len(per_rollout_stats), 1))
+        for obj_name, count in total_collision_counts.items()
+    }
     print("Average Rollout Stats")
-    print(json.dumps(avg_rollout_stats, indent=4))
+    print(json.dumps(make_json_serializable(avg_rollout_stats), indent=4))
 
     if write_video:
         video_writer.close()
@@ -368,22 +513,25 @@ def run_trained_agent(args):
         data_writer.close()
         print("Wrote dataset trajectories to {}".format(args.dataset_path))
 
-    if write_video:
+    stats_path = args.stats_path
+    if stats_path is None and write_video:
         stats_path = os.path.splitext(args.video_path)[0] + "_stats.json"
+    if stats_path is not None:
+        stats_dir = os.path.dirname(stats_path)
+        if stats_dir:
+            os.makedirs(stats_dir, exist_ok=True)
         stats_payload = dict(
-            agent=args.agent,
-            env=args.env,
-            seed=args.seed,
-            horizon=rollout_horizon,
-            n_rollouts=rollout_num_episodes,
-            video_path=args.video_path,
-            camera_names=args.camera_names,
-            video_target_mask_grid=args.video_target_mask_grid,
             average=avg_rollout_stats,
-            rollouts=[
-                {k: rollout_stats[k][i] for k in rollout_stats}
-                for i in range(rollout_num_episodes)
-            ],
+            totals=dict(
+                Non_Target_Collision_Object_Counts=total_collision_counts,
+                Obstacle_Guidance_Trigger_Count=None,
+                Obstacle_Guidance_Positive_Cost_Count=None,
+            ),
+            per_rollout_average=dict(
+                Non_Target_Collision_Object_Counts=avg_collision_counts,
+            ),
+            rollouts=[make_json_serializable(stats) for stats in per_rollout_stats],
+            args=vars(args),
         )
         with open(stats_path, "w") as f:
             json.dump(make_json_serializable(stats_payload), f, indent=4)
@@ -464,6 +612,13 @@ if __name__ == "__main__":
         help="render a 2-column video per camera: original RGB on the left and policy image observation on the right",
     )
 
+    parser.add_argument(
+        "--stats_path",
+        type=str,
+        default=None,
+        help="(optional) write rollout stats to this JSON path",
+    )
+
     # If provided, an hdf5 file will be written with the rollout data
     parser.add_argument(
         "--dataset_path",
@@ -486,6 +641,21 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="(optional) set seed for rollouts",
+    )
+
+    parser.add_argument(
+        "--target_object_name",
+        type=str,
+        default="Can",
+        help="target object excluded from non-target collision counts",
+    )
+
+    parser.add_argument(
+        "--obstacle_names",
+        type=str,
+        nargs="*",
+        default=None,
+        help="optional explicit non-target object names for collision counts",
     )
 
     parser.add_argument(
