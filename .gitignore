@@ -137,3 +137,6 @@ robomimic/exps/paper/
 
 # run folder
 runs/
+
+# local experiment outputs
+outputs/
