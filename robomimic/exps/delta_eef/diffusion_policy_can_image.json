@@ -1,13 +1,13 @@
 {
     "algo_name": "diffusion_policy",
     "experiment": {
-        "name": "diffusion_policy_can_yq_image",
+        "name": "diffusion_policy_can_delta_eef_image",
         "validate": true,
         "logging": {
             "terminal_output_to_txt": true,
             "log_tb": true,
-            "log_wandb": true,
-            "wandb_proj_name": "diffusion_policy_can_image"
+            "log_wandb": false,
+            "wandb_proj_name": "diffusion_policy_delta_eef"
         },
         "save": {
             "enabled": true,
@@ -38,7 +38,11 @@
         "ckpt_path": null
     },
     "train": {
-        "data": null,
+        "data": [
+            {
+                "path": "third_party/robomimic/datasets/can/yq/image_v15_delta_eef.hdf5"
+            }
+        ],
         "output_dir": "runs/trained_models",
         "normalize_weights_by_ds_size": false,
         "num_data_workers": 0,
@@ -53,15 +57,15 @@
         "frame_stack": 2,
         "pad_frame_stack": true,
         "dataset_keys": [
-            "actions",
+            "delta_eef_action",
             "rewards",
             "dones"
         ],
         "action_keys": [
-            "actions"
+            "delta_eef_action"
         ],
         "action_config": {
-            "actions": {
+            "delta_eef_action": {
                 "normalization": null
             }
         },
