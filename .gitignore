@@ -129,7 +129,6 @@ macros_private.py
 datasets/
 
 # AGENT SKILLS
-AGENTS.md
 skills/
 
 # paper configs (too many)
