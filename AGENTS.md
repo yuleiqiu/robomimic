@@ -2,6 +2,8 @@
 
 > Forked robomimic — adds guided diffusion policy with obstacle avoidance + parallel rollout.
 
+> **Status (2026-06-26)**: The obstacle-guidance code (`GuidedDiffusionPolicyUNet` + `utils/obstacle_guidance_utils.py`) is **retained as a reference implementation but the deployment approach was rejected** — see `../docs/route_b_validation/report.md` in the parent repo. The cost guidance didn't improve success rates; the 3-4 cm EEF tracking error of OSC's force-control PD controller at 20 Hz makes cost gradients unreliable.
+
 ## 1. Architecture Overview
 
 ```
@@ -73,9 +75,9 @@ In-place monkey-patch factory: copies `GuidedDiffusionPolicyUNet`'s guidance met
 
 ## 4. Guidance Utilities (`utils/obstacle_guidance_utils.py`)
 
-### Core Mapping (Route B target)
+### Core Mapping (action → EEF trajectory)
 
-- **`action_chunk_to_eef_xyz_traj()`** (L668): `traj = eef_pos + cumsum(action[:,:,:3] * scale + offset)`. **This linear mapping introduces 3-4cm RMSE vs actual OSC PD-controller dynamics** — the root cause of ineffective cost guidance.
+- **`action_chunk_to_eef_xyz_traj()`** (L668): `traj = eef_pos + cumsum(action[:,:,:3] * scale + offset)`. **The mapping itself is correct**; the 3-4 cm RMSE vs actual OSC PD-controller dynamics is OSC's force-control PD tracking limit at 20 Hz (small per-step targets underachieve), not an approximation error. See `../docs/route_b_validation/report.md` for the full validation that rejected Route B (switching prediction target to EEF trajectory).
 
 ### Cost Functions
 
