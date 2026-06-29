@@ -43,7 +43,7 @@
                 "path": "third_party/robomimic/datasets/can/yq/image_v15_abs_eef_pose_mink.hdf5"
             }
         ],
-        "output_dir": "outputs/robomimic/train",
+        "output_dir": "../../../outputs/robomimic/train",
         "normalize_weights_by_ds_size": false,
         "num_data_workers": 0,
         "hdf5_cache_mode": "low_dim",
