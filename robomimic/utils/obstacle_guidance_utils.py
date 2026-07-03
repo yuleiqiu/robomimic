@@ -671,6 +671,8 @@ def action_chunk_to_eef_xyz_traj(
     horizon=None,
     delta_pos_scale=1.0,
     delta_pos_offset=0.0,
+    trajectory_model=None,
+    trajectory_model_state=None,
 ):
     """
     Convert an action chunk into an approximate commanded eef xyz trajectory.
@@ -679,6 +681,19 @@ def action_chunk_to_eef_xyz_traj(
     if horizon is None:
         horizon = action_chunk.shape[1]
     horizon = min(horizon, action_chunk.shape[1])
+
+    if trajectory_model is not None:
+        if trajectory_model_state is None:
+            raise ValueError("trajectory_model_state is required when trajectory_model is provided")
+        state = _as_batched_tensor(
+            trajectory_model_state,
+            device=action_chunk.device,
+            dtype=action_chunk.dtype,
+        )
+        if state.shape[0] == 1 and action_chunk.shape[0] > 1:
+            state = state.expand(action_chunk.shape[0], -1)
+        traj = trajectory_model.predict_abs_traj(state=state, action_chunk=action_chunk)
+        return traj[:, :horizon, :3].to(device=action_chunk.device, dtype=action_chunk.dtype)
 
     current_eef_pos = _as_batched_tensor(
         current_eef_pos,
@@ -700,6 +715,8 @@ def action_chunk_to_eef_xy_traj(
     horizon=None,
     delta_pos_scale=1.0,
     delta_pos_offset=0.0,
+    trajectory_model=None,
+    trajectory_model_state=None,
 ):
     """
     Convert a normalized action chunk into an approximate eef xy trajectory.
@@ -723,6 +740,8 @@ def action_chunk_to_eef_xy_traj(
         horizon=horizon,
         delta_pos_scale=delta_pos_scale,
         delta_pos_offset=delta_pos_offset,
+        trajectory_model=trajectory_model,
+        trajectory_model_state=trajectory_model_state,
     )[..., :2]
 
 
@@ -734,6 +753,8 @@ def obstacle_xy_cost(
     horizon=8,
     delta_pos_scale=1.0,
     delta_pos_offset=0.0,
+    trajectory_model=None,
+    trajectory_model_state=None,
     return_stats=False,
 ):
     """
@@ -778,6 +799,8 @@ def obstacle_xy_cost(
         horizon=horizon,
         delta_pos_scale=delta_pos_scale,
         delta_pos_offset=delta_pos_offset,
+        trajectory_model=trajectory_model,
+        trajectory_model_state=trajectory_model_state,
     )
     dist = torch.linalg.norm(traj_xy[:, :, None, :] - centers_xy[None, None, :, :], dim=-1)
     penetration = F.relu(radii.reshape(1, 1, -1) - dist)
@@ -805,6 +828,8 @@ def obstacle_xyz_cylinder_cost(
     horizon=8,
     delta_pos_scale=1.0,
     delta_pos_offset=0.0,
+    trajectory_model=None,
+    trajectory_model_state=None,
     return_stats=False,
 ):
     """
@@ -850,6 +875,8 @@ def obstacle_xyz_cylinder_cost(
         horizon=horizon,
         delta_pos_scale=delta_pos_scale,
         delta_pos_offset=delta_pos_offset,
+        trajectory_model=trajectory_model,
+        trajectory_model_state=trajectory_model_state,
     )
     dist_xy = torch.linalg.norm(traj[:, :, None, :2] - centers[None, None, :, :2], dim=-1)
     xy_pen = F.relu(radii.reshape(1, 1, -1) - dist_xy)
@@ -883,6 +910,8 @@ def obstacle_pointcloud_cost(
     horizon=8,
     delta_pos_scale=1.0,
     delta_pos_offset=0.0,
+    trajectory_model=None,
+    trajectory_model_state=None,
     return_stats=False,
 ):
     """
@@ -925,6 +954,8 @@ def obstacle_pointcloud_cost(
         horizon=horizon,
         delta_pos_scale=delta_pos_scale,
         delta_pos_offset=delta_pos_offset,
+        trajectory_model=trajectory_model,
+        trajectory_model_state=trajectory_model_state,
     )
 
     if distance_mode == "xy":
@@ -1005,7 +1036,7 @@ def guidance_scale_for_step(guidance_scale, schedule, step_index, num_steps, gui
     raise ValueError("Unsupported obstacle guidance schedule '{}'".format(schedule))
 
 
-def normalized_negative_cost_grad_update(update_sample, cost, scale, grad_source=None, eps=1e-6):
+def normalized_negative_cost_grad_update(update_sample, cost, scale, grad_source=None, grad_mask=None, eps=1e-6):
     """
     Apply a per-batch normalized gradient step that decreases cost.
     """
@@ -1014,6 +1045,9 @@ def normalized_negative_cost_grad_update(update_sample, cost, scale, grad_source
     if grad_source is None:
         grad_source = update_sample
     grad = torch.autograd.grad(cost, grad_source, retain_graph=False, create_graph=False)[0]
+    if grad_mask is not None:
+        grad_mask = torch.as_tensor(grad_mask, dtype=grad.dtype, device=grad.device)
+        grad = grad * grad_mask.reshape(*([1] * (grad.ndim - 1)), -1)
     grad_flat = grad.reshape(grad.shape[0], -1)
     grad_norm = torch.linalg.norm(grad_flat, dim=1).clamp_min(eps)
     grad = grad / grad_norm.reshape(-1, *([1] * (grad.ndim - 1)))

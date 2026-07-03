@@ -22,6 +22,7 @@ import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.obstacle_guidance_utils as ObstacleGuidanceUtils
+import robomimic.utils.osc_forward_model_utils as OSCForwardModelUtils
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
 from robomimic.algo import RolloutPolicy
@@ -88,6 +89,17 @@ def get_current_eef_pos_from_obs(obs, obs_key="robot0_eef_pos"):
     if eef_pos.shape[-1] != 3:
         raise ValueError("Expected '{}' to have final dimension 3, got {}".format(obs_key, eef_pos.shape))
     return eef_pos
+
+
+def get_latest_obs_value(obs, obs_key):
+    value = np.asarray(obs[obs_key], dtype=np.float32)
+    if value.ndim >= 2:
+        value = value[-1]
+    return value.reshape(-1)
+
+
+def get_forward_model_state_from_obs(obs, obs_keys):
+    return np.concatenate([get_latest_obs_value(obs, key) for key in obs_keys], axis=0).astype(np.float32)
 
 
 def get_action_normalization_vector(policy):
@@ -453,6 +465,21 @@ def set_obstacle_guidance_context(policy, env, obs, args, step_i=0, cached_pc_fi
         collision_refine_scale=args.collision_refine_scale,
         final_collision_cost_threshold=args.final_collision_cost_threshold,
     )
+    if getattr(args, "guidance_position_only", False):
+        context["guidance_grad_mask"] = np.array(
+            [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            dtype=np.float32,
+        )
+    if args.trajectory_backend == "forward_model":
+        if getattr(args, "forward_model", None) is None:
+            raise RuntimeError("--trajectory_backend forward_model requires a loaded --forward_model_path")
+        context.update(
+            trajectory_model=args.forward_model,
+            trajectory_model_state=get_forward_model_state_from_obs(
+                obs=obs,
+                obs_keys=args.forward_model_state_obs_keys,
+            ),
+        )
 
     diagnostic_centers, diagnostic_radii, _, diagnostic_top_z, _ = ObstacleGuidanceUtils.get_oracle_obstacle_geometry(
         env=env,
@@ -470,6 +497,7 @@ def set_obstacle_guidance_context(policy, env, obs, args, step_i=0, cached_pc_fi
         current_eef_pos=current_eef_pos,
         geometry_source=args.guidance_geometry_source,
         guidance_mode=args.guidance_mode,
+        trajectory_backend=args.trajectory_backend,
         delta_pos_scale=delta_pos_scale,
     )
 
@@ -718,6 +746,12 @@ def write_command_file(args):
     print("Wrote rollout command to {}".format(path))
 
 
+def serializable_args(args):
+    args_dict = vars(args).copy()
+    args_dict.pop("forward_model", None)
+    return args_dict
+
+
 def run_obstacle_guided_agent(args):
     if args.render:
         assert len(args.camera_names) == 1
@@ -731,6 +765,17 @@ def run_obstacle_guided_agent(args):
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
     policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=args.agent, device=device, verbose=True)
     wrap_as_guided(policy)  # add guidance interface to loaded model
+    args.forward_model = None
+    if args.trajectory_backend == "forward_model":
+        if args.forward_model_path is None:
+            raise ValueError("--trajectory_backend forward_model requires --forward_model_path")
+        args.forward_model = OSCForwardModelUtils.load_osc_forward_model(args.forward_model_path, device=device)
+        print(
+            "Loaded OSC forward model from {} (horizon={})".format(
+                args.forward_model_path,
+                args.forward_model.horizon,
+            )
+        )
     if args.guidance_geometry_source == "pointcloud":
         raw_obs_keys = getattr(policy.policy.global_config, "all_obs_keys", [])
         if args.pc_depth_obs_key in raw_obs_keys:
@@ -839,7 +884,7 @@ def run_obstacle_guided_agent(args):
                         Non_Target_Collision_Object_Counts=avg_collision_counts,
                     ),
                     rollouts=[make_json_serializable(stats) for stats in per_rollout_stats],
-                    args=vars(args),
+                    args=serializable_args(args),
                 ),
                 f,
                 indent=4,
@@ -883,6 +928,31 @@ def parse_args():
     parser.add_argument("--xy_clearance", type=float, default=0.02, help="oracle-center xy clearance in metres")
     parser.add_argument("--z_clearance", type=float, default=0.03, help="oracle-center z clearance in metres")
     parser.add_argument("--guidance_horizon", type=int, default=8, help="number of predicted action steps in cost")
+    parser.add_argument(
+        "--guidance_position_only",
+        action="store_true",
+        help="apply guidance gradients only to xyz action dimensions; leave rotation and gripper unchanged",
+    )
+    parser.add_argument(
+        "--trajectory_backend",
+        type=str,
+        choices=["cumsum", "forward_model"],
+        default="cumsum",
+        help="action-to-EEF trajectory backend used by guidance cost",
+    )
+    parser.add_argument(
+        "--forward_model_path",
+        type=str,
+        default=None,
+        help="OSC forward model checkpoint path, required when --trajectory_backend forward_model",
+    )
+    parser.add_argument(
+        "--forward_model_state_obs_keys",
+        type=str,
+        nargs="+",
+        default=["robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"],
+        help="low-dimensional obs keys concatenated as forward model state",
+    )
     parser.add_argument(
         "--guidance_schedule",
         type=str,

@@ -113,6 +113,8 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
                 horizon=horizon,
                 delta_pos_scale=context.get("delta_pos_scale", 1.0),
                 delta_pos_offset=context.get("delta_pos_offset", 0.0),
+                trajectory_model=context.get("trajectory_model", None),
+                trajectory_model_state=context.get("trajectory_model_state", None),
                 return_stats=return_stats,
             )
         if geometry_source != "oracle_center":
@@ -126,6 +128,8 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
                 horizon=horizon,
                 delta_pos_scale=context.get("delta_pos_scale", 1.0),
                 delta_pos_offset=context.get("delta_pos_offset", 0.0),
+                trajectory_model=context.get("trajectory_model", None),
+                trajectory_model_state=context.get("trajectory_model_state", None),
                 return_stats=return_stats,
             )
         if guidance_mode == "xyz_cylinder":
@@ -139,6 +143,8 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
                 horizon=horizon,
                 delta_pos_scale=context.get("delta_pos_scale", 1.0),
                 delta_pos_offset=context.get("delta_pos_offset", 0.0),
+                trajectory_model=context.get("trajectory_model", None),
+                trajectory_model_state=context.get("trajectory_model_state", None),
                 return_stats=return_stats,
             )
         raise ValueError("Unsupported obstacle guidance mode '{}'".format(guidance_mode))
@@ -196,11 +202,13 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
             num_steps=num_steps,
             guidance_start_step=guidance_start_step,
         )
+        guidance_grad_mask = context.get("guidance_grad_mask", None)
         guided_sample, grad_norm = ObstacleGuidanceUtils.normalized_negative_cost_grad_update(
             update_sample=step_output.prev_sample,
             cost=cost,
             scale=rho_t,
             grad_source=naction_in,
+            grad_mask=guidance_grad_mask,
         )
 
         min_distance = cost_stats.get("min_distance", None)
@@ -223,6 +231,7 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
             min_z_clearance=None if min_z_clearance is None
             else TensorUtils.to_numpy(min_z_clearance),
             grad_norm=None if grad_norm is None else TensorUtils.to_numpy(grad_norm),
+            guidance_grad_mask=None if guidance_grad_mask is None else TensorUtils.to_numpy(guidance_grad_mask),
             num_obstacles=int(cost_stats["num_obstacles"]),
             num_points=int(cost_stats.get("num_points", 0)),
             obstacle_top_z=context.get("obstacle_top_z", None),
@@ -271,6 +280,7 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
                 cost=cost,
                 scale=scale,
                 grad_source=refined_in,
+                grad_mask=context.get("guidance_grad_mask", None),
             )
             refined = torch.clamp(refined, -1.0, 1.0)
             steps_taken += 1
