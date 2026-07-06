@@ -2,7 +2,7 @@
 
 > Forked robomimic — adds guided diffusion policy with obstacle avoidance + parallel rollout.
 
-> **Status (2026-06-26)**: The obstacle-guidance code (`GuidedDiffusionPolicyUNet` + `utils/obstacle_guidance_utils.py`) is **retained as a reference implementation but the deployment approach was rejected** — see `../docs/route_b_validation/report.md` in the parent repo. The cost guidance didn't improve success rates; the 3-4 cm EEF tracking error of OSC's force-control PD controller at 20 Hz makes cost gradients unreliable.
+> **Status (2026-07-06)**: The obstacle-guidance code (`GuidedDiffusionPolicyUNet` + `utils/obstacle_guidance_utils.py`) is **retained as a reference implementation but the gradient-guided OSC-action deployment path was rejected**. Forward-model and action-ranking code is also retained as a completed diagnostic branch. The parent repo has reopened Route B after confirming that built-in `OSC_POSE` can replay full-pose absolute EEF actions of the form `[next_eef_pos, quat2axisangle(next_eef_quat_site), gripper]`; see `../docs/route_b_validation/report.md`.
 
 ## 1. Architecture Overview
 
@@ -77,7 +77,7 @@ In-place monkey-patch factory: copies `GuidedDiffusionPolicyUNet`'s guidance met
 
 ### Core Mapping (action → EEF trajectory)
 
-- **`action_chunk_to_eef_xyz_traj()`** (L668): `traj = eef_pos + cumsum(action[:,:,:3] * scale + offset)`. **The mapping itself is correct**; the 3-4 cm RMSE vs actual OSC PD-controller dynamics is OSC's force-control PD tracking limit at 20 Hz (small per-step targets underachieve), not an approximation error. See `../docs/route_b_validation/report.md` for the full validation that rejected Route B (switching prediction target to EEF trajectory).
+- **`action_chunk_to_eef_xyz_traj()`** (L668): `traj = eef_pos + cumsum(action[:,:,:3] * scale + offset)`. This remains an unreliable trajectory proxy for OSC-action guidance: the 3-4 cm RMSE vs actual OSC PD-controller dynamics is the controller's tracking behavior at 20 Hz, not a calibration issue. This does **not** reject Route B in its corrected form; full-pose absolute EEF actions can be executed directly through built-in `OSC_POSE` when the action includes both position and site orientation target.
 
 ### Cost Functions
 
