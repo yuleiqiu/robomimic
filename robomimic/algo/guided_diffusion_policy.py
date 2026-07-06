@@ -30,6 +30,8 @@ def wrap_as_guided(policy):
         "_update_last_obstacle_guidance_info",
         "_guided_scheduler_step",
         "_refine_obstacle_guidance_action",
+        "_sample_unguided_action_predictions",
+        "_rank_action_predictions",
         "_get_action_trajectory",
     ]
     for k, v in attrs.items():
@@ -75,10 +77,14 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
             return False
         if not context.get("enabled", False):
             return False
+        if context.get("selection_mode", "gradient") == "none":
+            return False
         if context.get("geometry_source", "oracle_center") == "pointcloud":
             points = context.get("obstacle_points_world", None)
             if points is None or len(points) == 0:
                 return False
+            if context.get("selection_mode", "gradient") == "ranking":
+                return int(context.get("ranking_num_candidates", 1)) > 0
             return context.get("guidance_scale", 0.0) > 0.0
         centers = context.get("obstacle_centers_xyz", context.get("obstacle_centers_xy", None))
         radii = context.get("obstacle_radii", None)
@@ -86,6 +92,8 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
             return False
         if len(centers) == 0 or len(radii) == 0:
             return False
+        if context.get("selection_mode", "gradient") == "ranking":
+            return int(context.get("ranking_num_candidates", 1)) > 0
         return context.get("guidance_scale", 0.0) > 0.0
 
     # ------------------------------------------------------------------
@@ -317,6 +325,136 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
     # Override inference with guided denoising loop
     # ------------------------------------------------------------------
 
+    def _sample_unguided_action_predictions(
+        self,
+        nets,
+        obs_cond,
+        prediction_horizon,
+        action_dim,
+        num_samples,
+    ):
+        if obs_cond.shape[0] != 1:
+            raise ValueError("Action-chunk ranking currently expects rollout batch size 1")
+        if self.algo_config.ddpm.enabled is True:
+            num_inference_timesteps = self.algo_config.ddpm.num_inference_timesteps
+        elif self.algo_config.ddim.enabled is True:
+            num_inference_timesteps = self.algo_config.ddim.num_inference_timesteps
+        else:
+            raise ValueError
+
+        obs_cond = obs_cond.expand(num_samples, -1)
+        naction = torch.randn((num_samples, prediction_horizon, action_dim), device=self.device)
+
+        self.noise_scheduler.set_timesteps(num_inference_timesteps)
+        for k in self.noise_scheduler.timesteps:
+            noise_pred = nets["policy"]["noise_pred_net"](
+                sample=naction,
+                timestep=k,
+                global_cond=obs_cond,
+            )
+            naction = self.noise_scheduler.step(
+                model_output=noise_pred,
+                timestep=k,
+                sample=naction,
+            ).prev_sample
+        return naction
+
+    def _rank_action_predictions(self, action_predictions):
+        context = self.obstacle_guidance_context
+        cost, cost_stats = self._obstacle_guidance_cost(
+            action_chunk=action_predictions,
+            horizon=context.get("guidance_horizon", self.algo_config.horizon.action_horizon),
+            return_stats=True,
+        )
+        per_cost = cost_stats.get("per_batch_cost", None)
+        if per_cost is None:
+            per_cost = torch.zeros(
+                (action_predictions.shape[0],),
+                dtype=action_predictions.dtype,
+                device=action_predictions.device,
+            )
+
+        min_xy_distance = cost_stats.get("min_xy_distance", None)
+        min_distance = cost_stats.get("min_distance", None)
+        min_pointcloud_distance = cost_stats.get("min_pointcloud_distance", None)
+        display_distance = min_pointcloud_distance
+        if display_distance is None:
+            display_distance = min_xy_distance if min_xy_distance is not None else min_distance
+
+        min_cost = torch.amin(per_cost)
+        candidate_mask = per_cost <= (
+            min_cost + float(context.get("ranking_cost_tie_tolerance", 1e-10))
+        )
+        if display_distance is not None and bool(torch.any(candidate_mask)):
+            masked_distance = torch.where(
+                candidate_mask,
+                display_distance,
+                torch.full_like(display_distance, -float("inf")),
+            )
+            best_index = int(torch.argmax(masked_distance).detach().cpu().item())
+        else:
+            best_index = int(torch.argmin(per_cost).detach().cpu().item())
+
+        first_cost = float(per_cost[0].detach().cpu().item())
+        best_cost = float(per_cost[best_index].detach().cpu().item())
+        safe_threshold = float(context.get("ranking_safe_cost_threshold", 1e-8))
+        safe_count = int(torch.sum(per_cost <= safe_threshold).detach().cpu().item())
+        first_is_safe = first_cost <= safe_threshold
+        ranking_skipped = bool(context.get("ranking_only_if_first_unsafe", False) and first_is_safe)
+        if ranking_skipped:
+            best_index = 0
+            best_cost = first_cost
+
+        best_distance = None
+        first_distance = None
+        if display_distance is not None:
+            best_distance = float(display_distance[best_index].detach().cpu().item())
+            first_distance = float(display_distance[0].detach().cpu().item())
+
+        self.last_obstacle_guidance_info = dict(
+            applied=True,
+            selection_mode="ranking",
+            guidance_mode=context.get("guidance_mode", "xyz_cylinder"),
+            geometry_source=context.get("geometry_source", "oracle_center"),
+            trajectory_backend=context.get("trajectory_backend", "cumsum"),
+            candidate_count=int(action_predictions.shape[0]),
+            best_index=best_index,
+            ranking_skipped=ranking_skipped,
+            ranking_first_is_safe=first_is_safe,
+            cost=best_cost,
+            ranking_first_cost=first_cost,
+            ranking_best_cost=best_cost,
+            ranking_cost_improvement=first_cost - best_cost,
+            ranking_safe_count=safe_count,
+            ranking_safe_rate=float(safe_count / max(int(action_predictions.shape[0]), 1)),
+            ranking_first_distance=first_distance,
+            ranking_best_distance=best_distance,
+            ranking_distance_improvement=(
+                None if best_distance is None or first_distance is None
+                else best_distance - first_distance
+            ),
+            ranking_all_costs=TensorUtils.to_numpy(per_cost.detach()),
+            ranking_all_distances=(
+                None if display_distance is None else TensorUtils.to_numpy(display_distance.detach())
+            ),
+            min_distance=None if best_distance is None else best_distance,
+            min_xy_distance=None if min_xy_distance is None else TensorUtils.to_numpy(min_xy_distance[best_index:best_index + 1]),
+            min_pointcloud_distance=(
+                None if min_pointcloud_distance is None
+                else TensorUtils.to_numpy(min_pointcloud_distance[best_index:best_index + 1])
+            ),
+            min_z_clearance=(
+                None if cost_stats.get("min_z_clearance", None) is None
+                else TensorUtils.to_numpy(cost_stats["min_z_clearance"][best_index:best_index + 1])
+            ),
+            num_obstacles=int(cost_stats["num_obstacles"]),
+            num_points=int(cost_stats.get("num_points", 0)),
+            obstacle_top_z=context.get("obstacle_top_z", None),
+            z_clearance=context.get("z_clearance", None),
+            delta_pos_scale=context.get("delta_pos_scale", None),
+        )
+        return best_index
+
     def _get_action_trajectory(self, obs_dict, goal_dict=None):
         assert not self.nets.training
         To = self.algo_config.horizon.observation_horizon
@@ -356,10 +494,45 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
 
         guidance_enabled = self._obstacle_guidance_enabled()
         context = self.obstacle_guidance_context
+        selection_mode = context.get("selection_mode", "gradient") if context else "gradient"
+        if guidance_enabled and selection_mode == "ranking":
+            self.last_obstacle_guidance_info = dict(applied=False)
+            self.obstacle_guidance_sample_count += 1
+            with torch.no_grad():
+                action_predictions = self._sample_unguided_action_predictions(
+                    nets=nets,
+                    obs_cond=obs_cond,
+                    prediction_horizon=Tp,
+                    action_dim=action_dim,
+                    num_samples=int(context.get("ranking_num_candidates", 1)),
+                )
+                best_index = self._rank_action_predictions(action_predictions)
+            start = To - 1
+            end = start + Ta
+            action = action_predictions[best_index:best_index + 1, start:end].detach()
+            if self.last_obstacle_guidance_info is not None:
+                first_action = action_predictions[0:1, start:end].detach()
+                selected_action_for_exec = ObstacleGuidanceUtils.unnormalize_action_chunk(
+                    action_chunk=action,
+                    action_scale=context.get("action_scale", None),
+                    action_offset=context.get("action_offset", None),
+                )
+                first_action_for_exec = ObstacleGuidanceUtils.unnormalize_action_chunk(
+                    action_chunk=first_action,
+                    action_scale=context.get("action_scale", None),
+                    action_offset=context.get("action_offset", None),
+                )
+                self.last_obstacle_guidance_info.update(
+                    ranking_selected_action_chunk=TensorUtils.to_numpy(selected_action_for_exec[0]),
+                    ranking_first_action_chunk=TensorUtils.to_numpy(first_action_for_exec[0]),
+                )
+            return action
+
         final_refine_enabled = (
             context is not None
             and context.get("enabled", False)
             and context.get("final_collision_refine", False)
+            and selection_mode == "gradient"
         )
         guidance_start_pct = context.get("guidance_start_step_pct", 0.0) if context else 0.0
         guidance_start_step = int(len(self.noise_scheduler.timesteps) * guidance_start_pct)

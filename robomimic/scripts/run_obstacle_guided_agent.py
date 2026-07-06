@@ -445,17 +445,23 @@ def set_obstacle_guidance_context(policy, env, obs, args, step_i=0, cached_pc_fi
 
     context = dict(
         enabled=True,
+        selection_mode=args.selection_mode,
         geometry_source=args.guidance_geometry_source,
         guidance_mode=(
             args.guidance_mode
             if args.guidance_geometry_source == "oracle_center"
             else "pointcloud_{}".format(args.pc_distance_mode)
         ),
+        trajectory_backend=args.trajectory_backend,
         current_eef_pos=current_eef_pos,
         guidance_scale=args.guidance_scale,
         guidance_horizon=args.guidance_horizon,
         guidance_schedule=args.guidance_schedule,
         guidance_start_step_pct=getattr(args, "guidance_start_step_pct", 0.0),
+        ranking_num_candidates=args.ranking_num_candidates,
+        ranking_safe_cost_threshold=args.ranking_safe_cost_threshold,
+        ranking_cost_tie_tolerance=args.ranking_cost_tie_tolerance,
+        ranking_only_if_first_unsafe=args.ranking_only_if_first_unsafe,
         delta_pos_scale=delta_pos_scale,
         delta_pos_offset=delta_pos_offset,
         action_scale=action_scale,
@@ -601,6 +607,16 @@ def rollout(policy, env, horizon, args, video_writer=None):
     guidance_chunk_count = getattr(getattr(policy, "policy", policy), "obstacle_guidance_sample_count", 0)
     guidance_trigger_count = 0
     guidance_positive_cost_count = 0
+    ranking_candidate_counts = []
+    ranking_best_indices = []
+    ranking_safe_rates = []
+    ranking_cost_improvements = []
+    ranking_distance_improvements = []
+    ranking_first_costs = []
+    ranking_best_costs = []
+    ranking_first_distances = []
+    ranking_best_distances = []
+    ranking_skipped = []
     non_target_collision_step_count = 0
     collision_tracker = make_non_target_collision_tracker(env=env, args=args)
     log_printed = False
@@ -652,6 +668,20 @@ def rollout(policy, env, horizon, args, video_writer=None):
                 min_dist = guidance_info.get("min_pointcloud_distance", guidance_info.get("min_distance", None))
                 if min_dist is not None:
                     guidance_min_distances.append(float(np.min(min_dist)))
+                if guidance_info.get("selection_mode", None) == "ranking":
+                    ranking_candidate_counts.append(float(guidance_info.get("candidate_count", 0)))
+                    ranking_best_indices.append(float(guidance_info.get("best_index", 0)))
+                    ranking_safe_rates.append(float(guidance_info.get("ranking_safe_rate", 0.0)))
+                    ranking_cost_improvements.append(float(guidance_info.get("ranking_cost_improvement", 0.0)))
+                    ranking_first_costs.append(float(guidance_info.get("ranking_first_cost", 0.0)))
+                    ranking_best_costs.append(float(guidance_info.get("ranking_best_cost", 0.0)))
+                    if guidance_info.get("ranking_distance_improvement", None) is not None:
+                        ranking_distance_improvements.append(float(guidance_info["ranking_distance_improvement"]))
+                    if guidance_info.get("ranking_first_distance", None) is not None:
+                        ranking_first_distances.append(float(guidance_info["ranking_first_distance"]))
+                    if guidance_info.get("ranking_best_distance", None) is not None:
+                        ranking_best_distances.append(float(guidance_info["ranking_best_distance"]))
+                    ranking_skipped.append(float(guidance_info.get("ranking_skipped", False)))
             guidance_chunk_count = new_guidance_chunk_count
 
         next_obs, reward, done, _ = env.step(act)
@@ -708,6 +738,18 @@ def rollout(policy, env, horizon, args, video_writer=None):
         Obstacle_Guidance_Positive_Cost_Rate=(
             float(guidance_positive_cost_count / max(guidance_trigger_count, 1))
         ),
+        Ranking_Candidate_Count=float(np.mean(ranking_candidate_counts)) if len(ranking_candidate_counts) > 0 else 0.0,
+        Ranking_Best_Index=float(np.mean(ranking_best_indices)) if len(ranking_best_indices) > 0 else 0.0,
+        Ranking_Safe_Rate=float(np.mean(ranking_safe_rates)) if len(ranking_safe_rates) > 0 else 0.0,
+        Ranking_Cost_Improvement=float(np.mean(ranking_cost_improvements)) if len(ranking_cost_improvements) > 0 else 0.0,
+        Ranking_First_Cost=float(np.mean(ranking_first_costs)) if len(ranking_first_costs) > 0 else 0.0,
+        Ranking_Best_Cost=float(np.mean(ranking_best_costs)) if len(ranking_best_costs) > 0 else 0.0,
+        Ranking_Distance_Improvement=(
+            float(np.mean(ranking_distance_improvements)) if len(ranking_distance_improvements) > 0 else 0.0
+        ),
+        Ranking_First_Distance=float(np.mean(ranking_first_distances)) if len(ranking_first_distances) > 0 else 0.0,
+        Ranking_Best_Distance=float(np.mean(ranking_best_distances)) if len(ranking_best_distances) > 0 else 0.0,
+        Ranking_Skipped_Rate=float(np.mean(ranking_skipped)) if len(ranking_skipped) > 0 else 0.0,
         Non_Target_Collision_Count=float(non_target_collision_count),
         Non_Target_Collision_Step_Count=float(non_target_collision_step_count),
         Non_Target_Collision_Rate=float(non_target_collision_step_count / max(rollout_horizon, 1)),
@@ -917,6 +959,13 @@ def parse_args():
         default="pointcloud",
         help="obstacle geometry source for guidance",
     )
+    parser.add_argument(
+        "--selection_mode",
+        type=str,
+        choices=["none", "gradient", "ranking"],
+        default="gradient",
+        help="inference-time obstacle intervention: disabled, gradient guidance, or action-chunk ranking",
+    )
     parser.add_argument("--guidance_scale", type=float, default=0.03, help="guidance gradient step scale")
     parser.add_argument(
         "--guidance_mode",
@@ -928,6 +977,29 @@ def parse_args():
     parser.add_argument("--xy_clearance", type=float, default=0.02, help="oracle-center xy clearance in metres")
     parser.add_argument("--z_clearance", type=float, default=0.03, help="oracle-center z clearance in metres")
     parser.add_argument("--guidance_horizon", type=int, default=8, help="number of predicted action steps in cost")
+    parser.add_argument(
+        "--ranking_num_candidates",
+        type=int,
+        default=8,
+        help="number of independently sampled action chunks for --selection_mode ranking",
+    )
+    parser.add_argument(
+        "--ranking_safe_cost_threshold",
+        type=float,
+        default=1e-8,
+        help="cost threshold used to count ranking candidates as geometry-safe",
+    )
+    parser.add_argument(
+        "--ranking_cost_tie_tolerance",
+        type=float,
+        default=1e-10,
+        help="cost tolerance for ranking tie-breaks by maximum clearance",
+    )
+    parser.add_argument(
+        "--ranking_only_if_first_unsafe",
+        action="store_true",
+        help="leave the first sampled chunk unchanged when its ranking cost is already safe",
+    )
     parser.add_argument(
         "--guidance_position_only",
         action="store_true",

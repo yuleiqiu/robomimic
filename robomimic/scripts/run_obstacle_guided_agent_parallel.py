@@ -345,6 +345,13 @@ def parse_args():
         default="pointcloud",
         help="obstacle geometry source for guidance",
     )
+    parser.add_argument(
+        "--selection_mode",
+        type=str,
+        choices=["none", "gradient", "ranking"],
+        default="gradient",
+        help="inference-time obstacle intervention: disabled, gradient guidance, or action-chunk ranking",
+    )
     parser.add_argument("--guidance_scale", type=float, default=0.03, help="guidance gradient step scale")
     parser.add_argument(
         "--guidance_mode",
@@ -356,6 +363,29 @@ def parse_args():
     parser.add_argument("--xy_clearance", type=float, default=0.02, help="oracle-center xy clearance in metres")
     parser.add_argument("--z_clearance", type=float, default=0.03, help="oracle-center z clearance in metres")
     parser.add_argument("--guidance_horizon", type=int, default=8, help="number of predicted action steps in cost")
+    parser.add_argument(
+        "--ranking_num_candidates",
+        type=int,
+        default=8,
+        help="number of independently sampled action chunks for --selection_mode ranking",
+    )
+    parser.add_argument(
+        "--ranking_safe_cost_threshold",
+        type=float,
+        default=1e-8,
+        help="cost threshold used to count ranking candidates as geometry-safe",
+    )
+    parser.add_argument(
+        "--ranking_cost_tie_tolerance",
+        type=float,
+        default=1e-10,
+        help="cost tolerance for ranking tie-breaks by maximum clearance",
+    )
+    parser.add_argument(
+        "--ranking_only_if_first_unsafe",
+        action="store_true",
+        help="leave the first sampled chunk unchanged when its ranking cost is already safe",
+    )
     parser.add_argument(
         "--guidance_position_only",
         action="store_true",
