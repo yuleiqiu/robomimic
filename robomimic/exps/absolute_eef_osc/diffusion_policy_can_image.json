@@ -1,13 +1,13 @@
 {
     "algo_name": "diffusion_policy",
     "experiment": {
-        "name": "diffusion_policy_can_abs_eef_osc_image",
+        "name": "dp_can_abs_pose_osc",
         "validate": true,
         "logging": {
             "terminal_output_to_txt": true,
             "log_tb": true,
             "log_wandb": false,
-            "wandb_proj_name": "diffusion_policy_abs_eef_osc"
+            "wandb_proj_name": "eef_pose_osc_policy"
         },
         "save": {
             "every_n_epochs": 20,
@@ -28,7 +28,7 @@
     "train": {
         "data": [
             {
-                "path": "third_party/robomimic/datasets/can/yq/image_v15_abs_eef_osc.hdf5"
+                "path": "third_party/robomimic/datasets/can/yq/image_v15_abs_eef_pose_osc.hdf5"
             }
         ],
         "output_dir": "../../../outputs/robomimic/train",

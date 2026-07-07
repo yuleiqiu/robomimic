@@ -1,13 +1,13 @@
 {
     "algo_name": "diffusion_policy",
     "experiment": {
-        "name": "diffusion_policy_can_delta_eef_pose_osc_image",
+        "name": "dp_can_delta_pose_osc",
         "validate": true,
         "logging": {
             "terminal_output_to_txt": true,
             "log_tb": true,
             "log_wandb": false,
-            "wandb_proj_name": "diffusion_policy_delta_eef_pose_osc"
+            "wandb_proj_name": "eef_pose_osc_policy"
         },
         "save": {
             "every_n_epochs": 20,
