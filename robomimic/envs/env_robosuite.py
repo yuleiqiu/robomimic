@@ -84,6 +84,9 @@ class EnvRobosuite(EB.EnvBase):
 
         kwargs = deepcopy(kwargs)
         self.target_mask_image_config = kwargs.pop("target_mask_image", None)
+        self.controller_goal_update_mode = kwargs.pop("controller_goal_update_mode", None)
+        if self.controller_goal_update_mode is not None:
+            assert self.controller_goal_update_mode in ["achieved", "desired"]
 
         # update kwargs based on passed arguments
         update_kwargs = dict(
@@ -118,6 +121,7 @@ class EnvRobosuite(EB.EnvBase):
         self.env = robosuite.make(self._env_name, **kwargs)
         self.lang = lang
         self._lang_emb = LangUtils.get_lang_emb(self.lang)
+        self._refresh_robot_controllers()
 
         if self._is_v1:
             # Make sure joint position observations and eef vel observations are active
@@ -143,6 +147,29 @@ class EnvRobosuite(EB.EnvBase):
         info["is_success"] = self.is_success()
         return obs, r, self.is_done(), info
 
+    def _refresh_robot_controllers(self):
+        """
+        Refresh controller references and goals after simulator state mutation.
+
+        reset_to writes a flattened MuJoCo state after env reset, which can leave
+        robosuite controller references pointing at the pre-state-set pose.
+        Absolute OSC pose playback depends on these references being refreshed.
+        """
+        for robot in getattr(self.env, "robots", []):
+            for ctrl in getattr(robot, "part_controllers", {}).values():
+                if hasattr(ctrl, "update"):
+                    ctrl.update(force=True)
+                if hasattr(ctrl, "reset_goal"):
+                    if self.controller_goal_update_mode is None:
+                        ctrl.reset_goal()
+                    else:
+                        try:
+                            ctrl.reset_goal(goal_update_mode=self.controller_goal_update_mode)
+                        except TypeError:
+                            ctrl.reset_goal()
+                            if hasattr(ctrl, "set_goal_update_mode"):
+                                ctrl.set_goal_update_mode(self.controller_goal_update_mode)
+
     def reset(self, unset_ep_meta=True):
         """
         Reset environment.
@@ -159,6 +186,7 @@ class EnvRobosuite(EB.EnvBase):
             # (this feature was set from robosuite v1.5 onwards)
             self.env.unset_ep_meta()
         di = self.env.reset()
+        self._refresh_robot_controllers()
         return self.get_observation(di)        
 
     def reset_to(self, state):
@@ -204,6 +232,7 @@ class EnvRobosuite(EB.EnvBase):
         if "states" in state:
             self.env.sim.set_state_from_flattened(state["states"])
             self.env.sim.forward()
+            self._refresh_robot_controllers()
             should_ret = True
 
         if "goal" in state:
