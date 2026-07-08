@@ -60,12 +60,12 @@ import sys
 import h5py
 import imageio
 import numpy as np
+from collections import OrderedDict
 from copy import deepcopy
 
 import torch
 
 import robomimic.utils.file_utils as FileUtils
-import robomimic.utils.obstacle_guidance_utils as ObstacleGuidanceUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.tensor_utils as TensorUtils
 from robomimic.envs.env_base import EnvBase
@@ -116,10 +116,105 @@ def write_command_file(args):
     print("Wrote rollout command to {}".format(path))
 
 
+def unwrap_env(env):
+    while isinstance(env, EnvWrapper):
+        env = env.env
+    return env
+
+
+def get_raw_env(env):
+    env = unwrap_env(env)
+    return getattr(env, "env", env)
+
+
+def sim_geom_id(sim, geom_name):
+    try:
+        return sim.model.geom_name2id(geom_name)
+    except Exception:
+        return None
+
+
+def object_is_active_in_scene(sim, obj):
+    for attr in ("root_body", "body_name", "root_body_name"):
+        body_name = getattr(obj, attr, None)
+        if isinstance(body_name, (list, tuple)):
+            body_name = body_name[0] if len(body_name) > 0 else None
+        if body_name is None:
+            continue
+        try:
+            body_id = sim.model.body_name2id(body_name)
+        except Exception:
+            continue
+        return bool(sim.model.body_pos[body_id][2] > -10.0)
+    return True
+
+
+def iter_non_target_objects(raw_env, target_object_name=None, obstacle_names=None):
+    target_lower = target_object_name.lower() if target_object_name is not None else None
+    obstacle_name_set = set(name.lower() for name in obstacle_names) if obstacle_names else None
+    for obj in getattr(raw_env, "objects", []):
+        name = getattr(obj, "name", None)
+        if name is None:
+            continue
+        name_lower = name.lower()
+        if target_lower is not None and name_lower == target_lower:
+            continue
+        if obstacle_name_set is not None and name_lower not in obstacle_name_set:
+            continue
+        yield obj, name
+
+
+def get_obstacle_contact_geom_ids_by_name(env, target_object_name=None, obstacle_names=None):
+    raw_env = get_raw_env(env)
+    sim = getattr(raw_env, "sim", None)
+    if sim is None:
+        raise ValueError("Obstacle contact tracking requires simulator access")
+
+    geom_ids_by_name = OrderedDict()
+    for obj, name in iter_non_target_objects(raw_env, target_object_name, obstacle_names):
+        if not object_is_active_in_scene(sim=sim, obj=obj):
+            continue
+        geom_ids = []
+        for geom_name in getattr(obj, "contact_geoms", []):
+            geom_id = sim_geom_id(sim, geom_name)
+            if geom_id is not None:
+                geom_ids.append(geom_id)
+        if len(geom_ids) > 0:
+            geom_ids_by_name[name] = sorted(set(geom_ids))
+    return geom_ids_by_name
+
+
+def get_robot_contact_geom_ids(env):
+    raw_env = get_raw_env(env)
+    sim = getattr(raw_env, "sim", None)
+    if sim is None:
+        raise ValueError("Robot contact tracking requires simulator access")
+
+    geom_names = []
+    for robot in getattr(raw_env, "robots", []):
+        robot_model = getattr(robot, "robot_model", None)
+        if robot_model is not None:
+            geom_names.extend(getattr(robot_model, "contact_geoms", []))
+
+        gripper = getattr(robot, "gripper", None)
+        grippers = gripper.values() if isinstance(gripper, dict) else [gripper]
+        for grip in grippers:
+            if grip is None:
+                continue
+            geom_names.extend(getattr(grip, "contact_geoms", []))
+
+    geom_ids = []
+    for geom_name in geom_names:
+        geom_id = sim_geom_id(sim, geom_name)
+        if geom_id is not None:
+            geom_ids.append(geom_id)
+    return sorted(set(geom_ids))
+
+
 def make_non_target_collision_tracker(env, target_object_name="Can", obstacle_names=None):
-    raw_env = ObstacleGuidanceUtils.get_raw_env(env)
-    robot_geom_ids = set(ObstacleGuidanceUtils.get_robot_contact_geom_ids(env))
-    object_geom_ids_by_name = ObstacleGuidanceUtils.get_obstacle_contact_geom_ids_by_name(
+    raw_env = get_raw_env(env)
+    robot_geom_ids = set(get_robot_contact_geom_ids(env))
+    object_geom_ids_by_name = get_obstacle_contact_geom_ids_by_name(
         env=env,
         target_object_name=target_object_name,
         obstacle_names=obstacle_names,

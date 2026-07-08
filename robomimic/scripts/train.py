@@ -51,7 +51,7 @@ def train(config, device, resume=False):
     np.random.seed(config.train.seed)
     torch.manual_seed(config.train.seed)
 
-    torch.set_num_threads(2)
+    torch.set_num_threads(int(os.environ.get("ROBOMIMIC_TORCH_THREADS", 16)))
 
     print("\n============= New Training Run with Config =============")
     print(config)
