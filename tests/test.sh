@@ -14,3 +14,5 @@ echo "running tests for scripts..."
 python test_scripts.py
 echo "running tests for examples..."
 python test_examples.py
+echo "running guided denoising utility tests..."
+python test_guided_denoising_utils.py

@@ -3,11 +3,11 @@
 > Forked robomimic used by the parent project for clean-image Diffusion Policy
 > training and rollout on executable EEF-pose OSC action targets.
 
-> **Status (2026-07-08)**: The old obstacle-guidance, OSC forward-model, and
-> action-ranking implementation code has been removed. Results are retained in
-> the parent repo docs / outputs. The active path is `delta_eef_pose_action`,
-> which directly reconstructs the executed EEF pose trajectory and replaces the
-> old OSC-action forward-model route for this project.
+> **Status (2026-07-15)**: A registered `guided_diffusion_policy` inference
+> variant implements the first delta-EEF guided-denoising contract. The old
+> obstacle-guidance, OSC forward-model, and action-ranking implementations
+> remain removed. The active guidance path reconstructs trajectories directly
+> from `delta_eef_pose_action`.
 
 ## 1. Architecture Overview
 
@@ -37,6 +37,7 @@ algo class.
 | `Algo` | `algo/algo.py` | Root base: owns `self.nets`, creates optimizer, handles checkpoint serialize / deserialize |
 | `PolicyAlgo` | `algo/algo.py` | Adds abstract `get_action()` |
 | `DiffusionPolicyUNet` | `algo/diffusion_policy.py` | Core DDPM / DDIM diffusion policy |
+| `GuidedDiffusionPolicyUNet` | `algo/guided_diffusion_policy.py` | Registered opt-in DDIM guided variant |
 | `RolloutPolicy` | `algo/algo.py` | Rollout wrapper: obs norm, action unnorm, policy call |
 
 ## 2. Diffusion Policy Pipeline
@@ -62,6 +63,14 @@ Inference:
 2. Slice the action horizon.
 3. Queue actions and execute them left-to-right.
 4. `RolloutPolicy` unnormalizes actions before `env.step`.
+
+The base diffusion policy exposes an identity reverse-step hook. The guided
+variant overrides only that hook; the base policy and `RolloutPolicy` remain
+the unguided baseline. `utils/guided_denoising_utils.py` contains delta-EEF
+trajectory reconstruction, the XY LAN penetration cost, waypoint pushing and
+differencing, normalization-vector conversion, per-step diagnostics, and the
+in-memory loader that maps an existing `diffusion_policy` checkpoint to the
+registered guided variant without rewriting the checkpoint.
 
 ## 3. Active EEF-Pose OSC Configs
 
@@ -94,3 +103,27 @@ Both use clean image observations, DDIM with `num_train_timesteps=100` and
   `outputs/eef_pose_osc_policy/README.md` in the parent repo for the current
   conclusion and `docs/forward_model_guidance_next_steps.md` only as an
   archived result document.
+- Guided deployment context is runtime-only. Build it from the existing
+  `RolloutPolicy.action_normalization_stats`, then call
+  `policy.policy.set_guidance_context(...)` after `start_episode` and before a
+  new action chunk is sampled.
+- Guidance is DDIM-only, evaluates the executed `[:, 1:9]` clean-action slice,
+  and directly updates only that slice's XY delta-position coordinates.
+
+## 6. Guided-Denoising Verification
+
+Run the independent unit checks from the robomimic repo:
+
+```bash
+uv run python tests/test_guided_denoising_utils.py
+```
+
+The tests cover reconstruction, point versus displacement normalization,
+finite cost gradients, pushed-waypoint differencing, recorded before / after
+waypoint displacement vectors, executed-slice / action-dimension preservation,
+zero-cost parity, and algorithm / config registration.
+Checkpoint smoke verification should additionally confirm that the epoch-260
+delta-EEF checkpoint loads through `guided_policy_from_checkpoint`, that
+disabled and zero-scale samples exactly match the base policy under the same
+observation and random seed, and that a nonzero scale produces ten finite DDIM
+diagnostic records.

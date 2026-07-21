@@ -12,7 +12,7 @@ exps/
 ├── baseline/            ← original OSC action label experiments
 │   ├── diffusion_policy_can_image.json
 │   └── diffusion_policy_can_masked_image.json
-├── delta_eef/           ← Route B: real EEF delta label experiments
+├── delta_eef/           ← real EEF delta label experiments
 │   └── diffusion_policy_can_image.json
 └── <future_folder>/     ← e.g., absolute_eef, noise_augment, etc.
 ```
@@ -25,7 +25,7 @@ Each directory represents an **experiment variant** — a single axis of the exp
 
 Current axes:
 - `baseline` — original OSC delta action labels
-- `delta_eef` — real EEF delta labels (Route B, eliminates action→trajectory mapping error)
+- `delta_eef` — real EEF delta labels (eliminates action→trajectory mapping error)
 
 When adding a new variant, create a new top-level folder under `exps/`.
 

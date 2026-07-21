@@ -355,17 +355,34 @@ class DiffusionPolicyUNet(PolicyAlgo):
             )
 
             # inverse diffusion step (remove noise)
-            naction = self.noise_scheduler.step(
+            step_output = self.noise_scheduler.step(
                 model_output=noise_pred,
                 timestep=k,
                 sample=naction
-            ).prev_sample
+            )
+            naction = self._process_reverse_step(
+                step_output=step_output,
+                timestep=k,
+                observation_horizon=To,
+                action_horizon=Ta,
+            )
 
         # process action using Ta
         start = To - 1
         end = start + Ta
         action = naction[:,start:end]
         return action
+
+    def _process_reverse_step(
+        self,
+        step_output,
+        timestep,
+        observation_horizon,
+        action_horizon,
+    ):
+        """Hook for inference variants that modify a scheduler reverse step."""
+
+        return step_output.prev_sample
 
     def serialize(self):
         """
