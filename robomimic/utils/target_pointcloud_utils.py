@@ -1,0 +1,216 @@
+"""
+Deterministic target-object point clouds for robosuite environments.
+
+The extractor intentionally uses oracle MuJoCo geom segmentation. It merges the
+active target object with its translucent ``Visual<target>`` goal marker and
+excludes every other geom. Depth pixels are unprojected into world coordinates
+before deterministic farthest-point sampling.
+"""
+
+from dataclasses import dataclass
+
+import numpy as np
+from robosuite.utils import camera_utils as CameraUtils
+
+
+POINTCLOUD_OBS_KEY = "task_pointcloud"
+DEFAULT_POINTCLOUD_CONFIG = {
+    "enabled": True,
+    "obs_key": POINTCLOUD_OBS_KEY,
+    "camera_name": "agentview",
+    "height": 256,
+    "width": 256,
+    "target_object": "Can",
+    "include_visual_goal": True,
+    "num_points": 512,
+    # Reject transparent-goal segmentation pixels whose depth belongs to an
+    # occluding/background geom. This is comfortably larger than a Can.
+    "max_geom_distance": 0.15,
+}
+
+
+@dataclass(frozen=True)
+class TargetPointCloudRender:
+    points: np.ndarray
+    valid_points: np.ndarray
+    target_geom_ids: tuple
+
+
+def normalize_target_pointcloud_config(config):
+    """Return a validated config with stable defaults."""
+    if config is True:
+        config = {}
+    if not isinstance(config, dict):
+        raise TypeError("target_pointcloud must be a bool or dict")
+    normalized = dict(DEFAULT_POINTCLOUD_CONFIG)
+    normalized.update(config)
+    if not normalized["enabled"]:
+        return normalized
+    for key in ("height", "width", "num_points"):
+        normalized[key] = int(normalized[key])
+        if normalized[key] <= 0:
+            raise ValueError("{} must be positive".format(key))
+    for key in ("obs_key", "camera_name", "target_object"):
+        if not isinstance(normalized[key], str) or not normalized[key]:
+            raise ValueError("{} must be a non-empty string".format(key))
+    normalized["include_visual_goal"] = bool(normalized["include_visual_goal"])
+    max_geom_distance = normalized.get("max_geom_distance")
+    if max_geom_distance is not None:
+        max_geom_distance = float(max_geom_distance)
+        if max_geom_distance <= 0:
+            raise ValueError("max_geom_distance must be positive or null")
+    normalized["max_geom_distance"] = max_geom_distance
+    return normalized
+
+
+def get_target_and_goal_geom_ids(raw_env, target_object="Can", include_visual_goal=True):
+    """
+    Select exactly ``<target>_*`` and optionally ``Visual<target>_*`` geoms.
+
+    Prefix matching is deliberate: it includes both contact and visual geoms
+    for the physical object, while avoiding similarly named distractors.
+    """
+    prefixes = ["{}_".format(target_object)]
+    if include_visual_goal:
+        prefixes.append("Visual{}_".format(target_object))
+
+    geom_ids = []
+    for geom_id in range(raw_env.sim.model.ngeom):
+        geom_name = raw_env.sim.model.geom_id2name(geom_id)
+        if geom_name is not None and any(geom_name.startswith(prefix) for prefix in prefixes):
+            geom_ids.append(geom_id)
+    if not geom_ids:
+        raise ValueError(
+            "Could not find target geoms for {!r} (include_visual_goal={})".format(
+                target_object, include_visual_goal
+            )
+        )
+    return tuple(sorted(set(geom_ids)))
+
+
+def unproject_depth_pixels_to_world(depth_m, pixels_rc, intrinsic, camera_pose):
+    """Unproject top-left-origin image pixels with metric depth to world XYZ."""
+    depth_m = np.asarray(depth_m)
+    pixels_rc = np.asarray(pixels_rc)
+    intrinsic = np.asarray(intrinsic)
+    camera_pose = np.asarray(camera_pose)
+    if depth_m.ndim != 2:
+        raise ValueError("depth_m must have shape (H, W)")
+    if pixels_rc.ndim != 2 or pixels_rc.shape[1] != 2:
+        raise ValueError("pixels_rc must have shape (N, 2)")
+    if intrinsic.shape != (3, 3) or camera_pose.shape != (4, 4):
+        raise ValueError("intrinsic and camera_pose must have shapes (3,3) and (4,4)")
+    if len(pixels_rc) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    rows = pixels_rc[:, 0]
+    cols = pixels_rc[:, 1]
+    z = depth_m[rows, cols].astype(np.float64)
+    x = (cols.astype(np.float64) - intrinsic[0, 2]) * z / intrinsic[0, 0]
+    y = (rows.astype(np.float64) - intrinsic[1, 2]) * z / intrinsic[1, 1]
+    camera_points = np.stack((x, y, z, np.ones_like(z)), axis=-1)
+    world_points = camera_points @ camera_pose.T
+    return world_points[:, :3].astype(np.float32)
+
+
+def deterministic_farthest_point_sample(points, num_points):
+    """
+    Deterministically FPS to ``num_points`` and cyclically repeat if undersized.
+
+    The first point is the input point farthest from the centroid. Stable
+    ``argmax`` tie-breaking and row-major pixel enumeration make extraction
+    reproducible for a fixed simulator state.
+    """
+    points = np.asarray(points, dtype=np.float32)
+    num_points = int(num_points)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    if num_points <= 0:
+        raise ValueError("num_points must be positive")
+    if len(points) == 0:
+        raise ValueError("Cannot sample an empty point cloud")
+
+    if len(points) < num_points:
+        repeats = (num_points + len(points) - 1) // len(points)
+        return np.tile(points, (repeats, 1))[:num_points].copy()
+    if len(points) == num_points:
+        return points.copy()
+
+    centroid = points.astype(np.float64).mean(axis=0)
+    selected = np.empty(num_points, dtype=np.int64)
+    selected[0] = int(np.argmax(np.sum((points - centroid) ** 2, axis=1)))
+    min_sq_dist = np.sum((points - points[selected[0]]) ** 2, axis=1)
+    for index in range(1, num_points):
+        selected[index] = int(np.argmax(min_sq_dist))
+        candidate_sq_dist = np.sum((points - points[selected[index]]) ** 2, axis=1)
+        np.minimum(min_sq_dist, candidate_sq_dist, out=min_sq_dist)
+    return points[selected].copy()
+
+
+def render_target_pointcloud(raw_env, config=None, target_geom_ids=None, return_details=False):
+    """Render and extract one fixed-size world-frame target point cloud."""
+    config = normalize_target_pointcloud_config(config or {})
+    if not config["enabled"]:
+        raise ValueError("Cannot render a disabled target_pointcloud provider")
+    if target_geom_ids is None:
+        target_geom_ids = get_target_and_goal_geom_ids(
+            raw_env=raw_env,
+            target_object=config["target_object"],
+            include_visual_goal=config["include_visual_goal"],
+        )
+
+    segmentation, normalized_depth = raw_env.sim.render(
+        camera_name=config["camera_name"],
+        height=config["height"],
+        width=config["width"],
+        depth=True,
+        segmentation=True,
+    )
+    # MuJoCo renders bottom-up; robomimic observations use a top-left origin.
+    segmentation = segmentation[::-1]
+    normalized_depth = normalized_depth[::-1]
+    geom_ids = segmentation[..., 1]
+    mask = np.isin(geom_ids, np.asarray(target_geom_ids))
+    pixels_rc = np.argwhere(mask)
+    if len(pixels_rc) == 0:
+        raise RuntimeError(
+            "No target pixels rendered for geoms {} from camera {!r}".format(
+                target_geom_ids, config["camera_name"]
+            )
+        )
+
+    depth_m = CameraUtils.get_real_depth_map(raw_env.sim, normalized_depth)
+    intrinsic = CameraUtils.get_camera_intrinsic_matrix(
+        raw_env.sim,
+        camera_name=config["camera_name"],
+        camera_height=config["height"],
+        camera_width=config["width"],
+    )
+    camera_pose = CameraUtils.get_camera_extrinsic_matrix(
+        raw_env.sim, camera_name=config["camera_name"]
+    )
+    valid_points = unproject_depth_pixels_to_world(
+        depth_m=depth_m,
+        pixels_rc=pixels_rc,
+        intrinsic=intrinsic,
+        camera_pose=camera_pose,
+    )
+    finite = np.isfinite(valid_points).all(axis=1)
+    if config["max_geom_distance"] is not None:
+        pixel_geom_ids = geom_ids[mask]
+        geom_centers = np.asarray(
+            [raw_env.sim.data.geom_xpos[int(geom_id)] for geom_id in pixel_geom_ids]
+        )
+        finite &= (
+            np.linalg.norm(valid_points.astype(np.float64) - geom_centers, axis=1)
+            <= config["max_geom_distance"]
+        )
+    valid_points = valid_points[finite]
+    points = deterministic_farthest_point_sample(valid_points, config["num_points"])
+    if return_details:
+        return TargetPointCloudRender(
+            points=points,
+            valid_points=valid_points,
+            target_geom_ids=tuple(target_geom_ids),
+        )
+    return points

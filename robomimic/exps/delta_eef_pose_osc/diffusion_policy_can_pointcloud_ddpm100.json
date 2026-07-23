@@ -1,0 +1,123 @@
+{
+    "algo_name": "diffusion_policy",
+    "experiment": {
+        "name": "dp3_can_delta_pose_osc_ddpm100_seed500",
+        "validate": true,
+        "logging": {
+            "terminal_output_to_txt": true,
+            "log_tb": true,
+            "log_wandb": true,
+            "wandb_proj_name": "lan_o3dp_reproduction"
+        },
+        "save": {
+            "every_n_epochs": 20,
+            "on_best_rollout_success_rate": true,
+            "rollout_success_tiebreak_validation": true
+        },
+        "epoch_every_n_steps": 500,
+        "validation_epoch_every_n_steps": 50,
+        "render_video": false,
+        "rollout": {
+            "enabled": true,
+            "n": 50,
+            "horizon": 400,
+            "rate": 20,
+            "warmstart": 0,
+            "terminate_on_success": true
+        }
+    },
+    "train": {
+        "data": [
+            {
+                "path": "third_party/robomimic/datasets/can/yq/image_v15_delta_eef_pose_osc_pointcloud.hdf5"
+            }
+        ],
+        "output_dir": "../../../outputs/robomimic/train",
+        "normalize_weights_by_ds_size": false,
+        "num_data_workers": 0,
+        "hdf5_cache_mode": "low_dim",
+        "hdf5_use_swmr": true,
+        "hdf5_load_next_obs": false,
+        "hdf5_normalize_obs": false,
+        "hdf5_filter_key": "train",
+        "hdf5_validation_filter_key": "valid",
+        "seq_length": 16,
+        "pad_seq_length": true,
+        "frame_stack": 2,
+        "pad_frame_stack": true,
+        "dataset_keys": [
+            "delta_eef_pose_action",
+            "rewards",
+            "dones"
+        ],
+        "action_keys": [
+            "delta_eef_pose_action"
+        ],
+        "action_config": {
+            "delta_eef_pose_action": {
+                "normalization": "min_max"
+            }
+        },
+        "goal_mode": null,
+        "cuda": true,
+        "batch_size": 64,
+        "num_epochs": 600,
+        "seed": 500,
+        "max_grad_norm": null
+    },
+    "algo": {
+        "ddpm": {
+            "enabled": true,
+            "num_train_timesteps": 100,
+            "num_inference_timesteps": 100,
+            "beta_schedule": "squaredcos_cap_v2",
+            "clip_sample": true,
+            "prediction_type": "epsilon"
+        },
+        "ddim": {
+            "enabled": false,
+            "num_train_timesteps": 100,
+            "num_inference_timesteps": 10,
+            "beta_schedule": "squaredcos_cap_v2",
+            "clip_sample": true,
+            "set_alpha_to_one": true,
+            "steps_offset": 0,
+            "prediction_type": "epsilon"
+        },
+        "horizon": {
+            "observation_horizon": 2,
+            "prediction_horizon": 16,
+            "action_horizon": 8
+        }
+    },
+    "observation": {
+        "modalities": {
+            "obs": {
+                "low_dim": [
+                    "robot0_eef_pos",
+                    "robot0_eef_quat",
+                    "robot0_gripper_qpos"
+                ],
+                "rgb": [],
+                "depth": [],
+                "scan": [
+                    "task_pointcloud"
+                ]
+            },
+            "goal": {
+                "low_dim": [],
+                "rgb": [],
+                "depth": [],
+                "scan": []
+            }
+        },
+        "encoder": {
+            "scan": {
+                "core_class": "DP3PointCloudCore",
+                "core_kwargs": {},
+                "obs_randomizer_class": null,
+                "obs_randomizer_kwargs": {}
+            }
+        }
+    }
+}

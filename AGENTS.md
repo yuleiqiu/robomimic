@@ -3,11 +3,10 @@
 > Forked robomimic used by the parent project for clean-image Diffusion Policy
 > training and rollout on executable EEF-pose OSC action targets.
 
-> **Status (2026-07-15)**: A registered `guided_diffusion_policy` inference
-> variant implements the first delta-EEF guided-denoising contract. The old
-> obstacle-guidance, OSC forward-model, and action-ranking implementations
-> remain removed. The active guidance path reconstructs trajectories directly
-> from `delta_eef_pose_action`.
+> **Status (2026-07-23)**: Phase 1 of the LAN-O3DP reproduction adds a
+> point-cloud-conditioned DDPM training path while retaining the completed
+> `guided_diffusion_policy` mechanism baseline. Paper guidance remains deferred
+> until a point-cloud checkpoint is trained and explicitly confirmed.
 
 ## 1. Architecture Overview
 
@@ -38,6 +37,7 @@ algo class.
 | `PolicyAlgo` | `algo/algo.py` | Adds abstract `get_action()` |
 | `DiffusionPolicyUNet` | `algo/diffusion_policy.py` | Core DDPM / DDIM diffusion policy |
 | `GuidedDiffusionPolicyUNet` | `algo/guided_diffusion_policy.py` | Registered opt-in DDIM guided variant |
+| `DP3PointCloudCore` | `models/obs_core.py` | 3→32→64→64 per-point MLP, residual, max-pool, 64-D output |
 | `RolloutPolicy` | `algo/algo.py` | Rollout wrapper: obs norm, action unnorm, policy call |
 
 ## 2. Diffusion Policy Pipeline
@@ -78,9 +78,14 @@ registered guided variant without rewriting the checkpoint.
 |--------|------------|---------|
 | `robomimic/exps/delta_eef_pose_osc/diffusion_policy_can_image.json` | `delta_eef_pose_action` | Preferred clean-image policy target |
 | `robomimic/exps/absolute_eef_osc/diffusion_policy_can_image.json` | `abs_eef_pose_action` | Absolute EEF comparison baseline |
+| `robomimic/exps/delta_eef_pose_osc/diffusion_policy_can_pointcloud_ddpm100.json` | `delta_eef_pose_action` | LAN-O3DP Phase-1 point-cloud DDPM100 policy |
 
 Both use clean image observations, DDIM with `num_train_timesteps=100` and
 `num_inference_timesteps=10`, and min-max action normalization.
+
+The point-cloud config instead uses `task_pointcloud` through the existing
+`scan` modality, DDPM epsilon prediction with 100 train / inference steps,
+horizons 2 / 16 / 8, min-max action normalization, and seed 500.
 
 ## 4. Key Scripts
 
@@ -95,6 +100,10 @@ Both use clean image observations, DDIM with `num_train_timesteps=100` and
 
 - `envs/env_robosuite.py` includes controller refresh after `reset_to`, needed
   for reliable OSC absolute / desired-goal delta replay.
+- `envs/env_robosuite.py` also supports an opt-in `target_pointcloud`
+  observation provider and forces offscreen rendering for it even when RGB is
+  not a policy observation. Offline generation and runtime rollout both call
+  `utils/target_pointcloud_utils.py`.
 - `utils/torch_utils.py` honors `ROBOMIMIC_GPU_ID` so separate training runs can
   bind PyTorch devices without using `CUDA_VISIBLE_DEVICES`.
 - `scripts/train.py` honors `ROBOMIMIC_TORCH_THREADS` for local throughput

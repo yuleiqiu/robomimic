@@ -542,10 +542,16 @@ class RolloutPolicy(object):
             # limit normalization to obs keys being used, in case environment includes extra keys
             ob = { k : ob[k] for k in self.policy.global_config.all_obs_keys }
             ob = ObsUtils.normalize_dict(ob, normalization_stats=obs_normalization_stats)
-        # postprocess visual observations
+        # Postprocess non-low-dimensional observations. Scan observations use
+        # the same HDF5-to-network channel swap during online rollout as they
+        # do in SequenceDataset.
         if postprocess_visual_obs:
             for k in ob:
-                if ObsUtils.key_is_obs_modality(key=k, obs_modality="rgb") or ObsUtils.key_is_obs_modality(key=k, obs_modality="depth"):
+                if (
+                    ObsUtils.key_is_obs_modality(key=k, obs_modality="rgb")
+                    or ObsUtils.key_is_obs_modality(key=k, obs_modality="depth")
+                    or ObsUtils.key_is_obs_modality(key=k, obs_modality="scan")
+                ):
                     ob[k] = ObsUtils.process_obs(obs=ob[k], obs_key=k)
         return ob
 

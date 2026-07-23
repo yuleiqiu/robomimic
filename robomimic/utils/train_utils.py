@@ -522,6 +522,11 @@ def should_save_from_rollout_logs(
         epoch_ckpt_name,
         save_on_best_rollout_return,
         save_on_best_rollout_success_rate,
+        rollout_success_tiebreak_validation=False,
+        current_validation_loss=None,
+        current_epoch=None,
+        best_success_validation_loss=None,
+        best_success_epoch=None,
     ):
     """
     Helper function used during training to determine whether checkpoints and videos
@@ -554,6 +559,15 @@ def should_save_from_rollout_logs(
             @should_save_ckpt (True if should save this checkpoint), and @ckpt_reason
             (string that contains the reason for saving the checkpoint)
     """
+    if best_success_validation_loss is None:
+        best_success_validation_loss = {
+            env_name: np.inf for env_name in all_rollout_logs
+        }
+    if best_success_epoch is None:
+        best_success_epoch = {
+            env_name: np.iinfo(np.int64).max for env_name in all_rollout_logs
+        }
+
     should_save_ckpt = False
     ckpt_reason = None
     for env_name in all_rollout_logs:
@@ -567,8 +581,30 @@ def should_save_from_rollout_logs(
                 should_save_ckpt = True
                 ckpt_reason = "return"
 
-        if rollout_logs["Success_Rate"] > best_success_rate[env_name]:
-            best_success_rate[env_name] = rollout_logs["Success_Rate"]
+        success_rate = rollout_logs["Success_Rate"]
+        success_is_better = success_rate > best_success_rate[env_name]
+        if (
+            rollout_success_tiebreak_validation
+            and success_rate == best_success_rate[env_name]
+            and current_validation_loss is not None
+        ):
+            success_is_better = (
+                current_validation_loss < best_success_validation_loss[env_name]
+                or (
+                    current_validation_loss == best_success_validation_loss[env_name]
+                    and current_epoch is not None
+                    and current_epoch < best_success_epoch[env_name]
+                )
+            )
+
+        if success_is_better:
+            best_success_rate[env_name] = success_rate
+            best_success_validation_loss[env_name] = (
+                np.inf if current_validation_loss is None else current_validation_loss
+            )
+            best_success_epoch[env_name] = (
+                np.iinfo(np.int64).max if current_epoch is None else current_epoch
+            )
             if save_on_best_rollout_success_rate:
                 # save checkpoint if achieve new best success rate
                 epoch_ckpt_name += "_{}_success_{}".format(env_name, best_success_rate[env_name])
@@ -579,6 +615,8 @@ def should_save_from_rollout_logs(
     return dict(
         best_return=best_return,
         best_success_rate=best_success_rate,
+        best_success_validation_loss=best_success_validation_loss,
+        best_success_epoch=best_success_epoch,
         epoch_ckpt_name=epoch_ckpt_name,
         should_save_ckpt=should_save_ckpt,
         ckpt_reason=ckpt_reason,

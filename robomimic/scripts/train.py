@@ -280,6 +280,14 @@ def train(config, device, resume=False):
     best_valid_loss = None
     best_return = {k: -np.inf for k in envs} if config.experiment.rollout.enabled else None
     best_success_rate = {k: -1. for k in envs} if config.experiment.rollout.enabled else None
+    best_success_validation_loss = (
+        {k: np.inf for k in envs} if config.experiment.rollout.enabled else None
+    )
+    best_success_epoch = (
+        {k: np.iinfo(np.int64).max for k in envs}
+        if config.experiment.rollout.enabled
+        else None
+    )
     last_ckpt_time = time.time()
 
     start_epoch = 1 # epoch numbers start at 1
@@ -290,6 +298,14 @@ def train(config, device, resume=False):
         best_valid_loss = variable_state["best_valid_loss"]
         best_return = variable_state["best_return"]
         best_success_rate = variable_state["best_success_rate"]
+        best_success_validation_loss = variable_state.get(
+            "best_success_validation_loss",
+            {k: np.inf for k in envs},
+        )
+        best_success_epoch = variable_state.get(
+            "best_success_epoch",
+            {k: np.iinfo(np.int64).max for k in envs},
+        )
         print("*" * 50)
         print("resuming training from epoch {}".format(start_epoch))
         print("*" * 50)
@@ -330,6 +346,7 @@ def train(config, device, resume=False):
                 data_logger.record("Train/{}".format(k), v, epoch)
 
         # Evaluate the model on validation set
+        current_valid_loss = None
         if config.experiment.validate:
             with torch.no_grad():
                 step_log = TrainUtils.run_epoch(
@@ -351,6 +368,8 @@ def train(config, device, resume=False):
 
             # save checkpoint if achieve new best validation loss
             valid_check = "Loss" in step_log
+            if valid_check:
+                current_valid_loss = step_log["Loss"]
             if valid_check and (best_valid_loss is None or (step_log["Loss"] <= best_valid_loss)):
                 best_valid_loss = step_log["Loss"]
                 if config.experiment.save.enabled and config.experiment.save.on_best_validation:
@@ -406,9 +425,18 @@ def train(config, device, resume=False):
                 epoch_ckpt_name=epoch_ckpt_name,
                 save_on_best_rollout_return=config.experiment.save.on_best_rollout_return,
                 save_on_best_rollout_success_rate=config.experiment.save.on_best_rollout_success_rate,
+                rollout_success_tiebreak_validation=(
+                    config.experiment.save.rollout_success_tiebreak_validation
+                ),
+                current_validation_loss=current_valid_loss,
+                current_epoch=epoch,
+                best_success_validation_loss=best_success_validation_loss,
+                best_success_epoch=best_success_epoch,
             )
             best_return = updated_stats["best_return"]
             best_success_rate = updated_stats["best_success_rate"]
+            best_success_validation_loss = updated_stats["best_success_validation_loss"]
+            best_success_epoch = updated_stats["best_success_epoch"]
             epoch_ckpt_name = updated_stats["epoch_ckpt_name"]
             should_save_ckpt = (config.experiment.save.enabled and updated_stats["should_save_ckpt"]) or should_save_ckpt
             if updated_stats["ckpt_reason"] is not None:
@@ -420,6 +448,8 @@ def train(config, device, resume=False):
             best_valid_loss=best_valid_loss,
             best_return=best_return,
             best_success_rate=best_success_rate,
+            best_success_validation_loss=best_success_validation_loss,
+            best_success_epoch=best_success_epoch,
         )
 
         # Save model checkpoints based on conditions (success rate, validation loss, etc)

@@ -360,6 +360,51 @@ class ScanCore(EncoderCore, BaseNets.ConvBase):
         return msg
 
 
+class DP3PointCloudCore(EncoderCore):
+    """
+    Compact permutation-invariant point-cloud encoder used by the DP3 baseline.
+
+    Inputs use robomimic's processed scan layout ``[B, 3, N]``. The per-point
+    network is 3 -> 32 -> 64 -> 64 with LayerNorm and a residual 64-D block,
+    followed by max pooling over points.
+    """
+
+    def __init__(self, input_shape):
+        super(DP3PointCloudCore, self).__init__(input_shape=input_shape)
+        if len(input_shape) != 2 or input_shape[0] != 3:
+            raise ValueError(
+                "DP3PointCloudCore expects processed scan shape (3, N), got {}".format(
+                    input_shape
+                )
+            )
+        self.linear1 = nn.Linear(3, 32)
+        self.norm1 = nn.LayerNorm(32)
+        self.linear2 = nn.Linear(32, 64)
+        self.norm2 = nn.LayerNorm(64)
+        self.linear3 = nn.Linear(64, 64)
+        self.norm3 = nn.LayerNorm(64)
+        self.activation = nn.ReLU()
+
+    def output_shape(self, input_shape):
+        if len(input_shape) != 2 or input_shape[0] != 3:
+            raise ValueError("Expected input shape (3, N), got {}".format(input_shape))
+        return [64]
+
+    def forward(self, inputs):
+        if tuple(inputs.shape[-2:]) != tuple(self.input_shape):
+            raise ValueError(
+                "Expected trailing shape {}, got {}".format(
+                    tuple(self.input_shape), tuple(inputs.shape[-2:])
+                )
+            )
+        points = inputs.transpose(-1, -2)
+        hidden = self.activation(self.norm1(self.linear1(points)))
+        hidden = self.activation(self.norm2(self.linear2(hidden)))
+        residual = self.norm3(self.linear3(hidden))
+        hidden = self.activation(hidden + residual)
+        return torch.max(hidden, dim=-2).values
+
+
 """
 ================================================
 Observation Randomizer Networks

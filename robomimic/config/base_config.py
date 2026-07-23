@@ -96,6 +96,9 @@ class BaseConfig(Config):
         self.experiment.save.on_best_validation = False             # save models that achieve best validation score
         self.experiment.save.on_best_rollout_return = False         # save models that achieve best rollout return
         self.experiment.save.on_best_rollout_success_rate = True    # save models that achieve best success rate
+        # If enabled, equal rollout success is broken by lower current validation
+        # loss. An exact second tie keeps the earlier epoch.
+        self.experiment.save.rollout_success_tiebreak_validation = False
 
         # epoch definitions - if not None, set an epoch to be this many gradient steps, else the full dataset size will be used
         self.experiment.epoch_every_n_steps = 100                   # number of gradient steps in train epoch (None for full dataset pass)

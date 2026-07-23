@@ -33,6 +33,7 @@ except ImportError:
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.lang_utils as LangUtils
 import robomimic.utils.target_mask_utils as TargetMaskUtils
+import robomimic.utils.target_pointcloud_utils as TargetPointCloudUtils
 import robomimic.envs.env_base as EB
 
 # protect against missing mujoco-py module, since robosuite might be using mujoco-py or DM backend
@@ -84,6 +85,9 @@ class EnvRobosuite(EB.EnvBase):
 
         kwargs = deepcopy(kwargs)
         self.target_mask_image_config = kwargs.pop("target_mask_image", None)
+        self.target_pointcloud_config = TargetPointCloudUtils.normalize_target_pointcloud_config(
+            kwargs.pop("target_pointcloud", {"enabled": False})
+        )
         self.controller_goal_update_mode = kwargs.pop("controller_goal_update_mode", None)
         if self.controller_goal_update_mode is not None:
             assert self.controller_goal_update_mode in ["achieved", "desired"]
@@ -91,7 +95,9 @@ class EnvRobosuite(EB.EnvBase):
         # update kwargs based on passed arguments
         update_kwargs = dict(
             has_renderer=render,
-            has_offscreen_renderer=(render_offscreen or use_image_obs),
+            has_offscreen_renderer=(
+                render_offscreen or use_image_obs or self.target_pointcloud_config["enabled"]
+            ),
             ignore_done=True,
             use_object_obs=True,
             use_camera_obs=use_image_obs,
@@ -118,6 +124,8 @@ class EnvRobosuite(EB.EnvBase):
         self._env_name = env_name
 
         self._init_kwargs = deepcopy(kwargs)
+        if self.target_pointcloud_config["enabled"]:
+            self._init_kwargs["target_pointcloud"] = deepcopy(self.target_pointcloud_config)
         self.env = robosuite.make(self._env_name, **kwargs)
         self.lang = lang
         self._lang_emb = LangUtils.get_lang_emb(self.lang)
@@ -320,6 +328,13 @@ class EnvRobosuite(EB.EnvBase):
             obs=ret,
             mask_config=self.target_mask_image_config,
         )
+        if self.target_pointcloud_config["enabled"]:
+            ret[self.target_pointcloud_config["obs_key"]] = (
+                TargetPointCloudUtils.render_target_pointcloud(
+                    raw_env=self.env,
+                    config=self.target_pointcloud_config,
+                )
+            )
         return ret
 
     def get_real_depth_map(self, depth_map):
