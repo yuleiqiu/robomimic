@@ -5,8 +5,9 @@
 
 > **Status (2026-07-23)**: Phase 1 of the LAN-O3DP reproduction adds a
 > point-cloud-conditioned DDPM training path while retaining the completed
-> `guided_diffusion_policy` mechanism baseline. Paper guidance remains deferred
-> until a point-cloud checkpoint is trained and explicitly confirmed.
+> `guided_diffusion_policy` mechanism baseline. The seed-500 run completed 600
+> epochs but its best clean 50-rollout Task SR was 0.82, below the fixed 0.90
+> gate. Paper guidance remains deferred pending an explicit human decision.
 
 ## 1. Architecture Overview
 
