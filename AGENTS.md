@@ -3,11 +3,12 @@
 > Forked robomimic used by the parent project for clean-image Diffusion Policy
 > training and rollout on executable EEF-pose OSC action targets.
 
-> **Status (2026-07-23)**: Phase 1 of the LAN-O3DP reproduction adds a
-> point-cloud-conditioned DDPM training path while retaining the completed
-> `guided_diffusion_policy` mechanism baseline. The seed-500 run completed 600
-> epochs but its best clean 50-rollout Task SR was 0.82, below the fixed 0.90
-> gate. Paper guidance remains deferred pending an explicit human decision.
+> **Status (2026-07-28)**: the LAN-O3DP point-cloud training and guided
+> deployment branch is complete and closed after missing its clean-source and
+> paired task gates. The current parent-project branch uses this fork to build
+> a targeted fine-tuning upper bound from the reliable clean-image
+> `delta_eef_pose_action` epoch-260 checkpoint. Preserve the completed LAN and
+> guided code as reproducible baselines.
 
 ## 1. Architecture Overview
 
@@ -38,6 +39,8 @@ algo class.
 | `PolicyAlgo` | `algo/algo.py` | Adds abstract `get_action()` |
 | `DiffusionPolicyUNet` | `algo/diffusion_policy.py` | Core DDPM / DDIM diffusion policy |
 | `GuidedDiffusionPolicyUNet` | `algo/guided_diffusion_policy.py` | Registered opt-in DDIM guided variant |
+| `LanO3DPUNet` | `algo/lan_o3dp.py` | LAN-aligned point-cloud diffusion policy |
+| `GuidedLanO3DPUNet` | `algo/lan_o3dp.py` | Opt-in guided LAN variant for DDPM checkpoints |
 | `DP3PointCloudCore` | `models/obs_core.py` | 3→32→64→64 per-point MLP, residual, max-pool, 64-D output |
 | `RolloutPolicy` | `algo/algo.py` | Rollout wrapper: obs norm, action unnorm, policy call |
 
@@ -73,29 +76,32 @@ differencing, normalization-vector conversion, per-step diagnostics, and the
 in-memory loader that maps an existing `diffusion_policy` checkpoint to the
 registered guided variant without rewriting the checkpoint.
 
-## 3. Active EEF-Pose OSC Configs
+## 3. Project EEF-Pose OSC Configs
 
 | Config | Action Key | Purpose |
 |--------|------------|---------|
 | `robomimic/exps/delta_eef_pose_osc/diffusion_policy_can_image.json` | `delta_eef_pose_action` | Preferred clean-image policy target |
 | `robomimic/exps/absolute_eef_osc/diffusion_policy_can_image.json` | `abs_eef_pose_action` | Absolute EEF comparison baseline |
-| `robomimic/exps/delta_eef_pose_osc/diffusion_policy_can_pointcloud_ddpm100.json` | `delta_eef_pose_action` | LAN-O3DP Phase-1 point-cloud DDPM100 policy |
+| `robomimic/exps/delta_eef_pose_osc/diffusion_policy_can_pointcloud_ddpm100.json` | `delta_eef_pose_action` | Completed seed-500 point-cloud DDPM100 baseline |
+| `robomimic/exps/delta_eef_pose_osc/lan_o3dp_can_delta_pose_eps_residual_40demo_seed42.json` | `delta_eef_pose_action` | Completed LAN-aligned 40-demo baseline |
 
-Both use clean image observations, DDIM with `num_train_timesteps=100` and
-`num_inference_timesteps=10`, and min-max action normalization.
+The clean-image delta and absolute configs use DDIM with
+`num_train_timesteps=100`, `num_inference_timesteps=10`, and min-max action
+normalization.
 
-The point-cloud config instead uses `task_pointcloud` through the existing
-`scan` modality, DDPM epsilon prediction with 100 train / inference steps,
-horizons 2 / 16 / 8, min-max action normalization, and seed 500.
+The point-cloud configs use `task_pointcloud` through the existing `scan`
+modality, DDPM epsilon prediction with 100 train / inference steps, horizons
+2 / 16 / 8, and min-max normalization. They are historical experiment configs,
+not the starting point for targeted fine-tuning.
 
 ## 4. Key Scripts
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/train.py` | Training entry: config -> data -> model -> train loop -> checkpoint |
-| `scripts/run_trained_agent.py` | Roll out a checkpoint in one process |
-| `scripts/run_trained_agent_parallel.py` | Multi-process checkpoint rollout |
-| `scripts/create_target_mask_image_dataset.py` | Preprocess PickPlace datasets with target mask images |
+| `robomimic/scripts/train.py` | Training entry: config -> data -> model -> train loop -> checkpoint |
+| `robomimic/scripts/run_trained_agent.py` | Roll out a checkpoint in one process |
+| `robomimic/scripts/run_trained_agent_parallel.py` | Multi-process checkpoint rollout |
+| `robomimic/scripts/create_target_mask_image_dataset.py` | Preprocess PickPlace datasets with target mask images |
 
 ## 5. Project-Specific Notes
 
@@ -109,6 +115,17 @@ horizons 2 / 16 / 8, min-max action normalization, and seed 500.
   bind PyTorch devices without using `CUDA_VISIBLE_DEVICES`.
 - `scripts/train.py` honors `ROBOMIMIC_TORCH_THREADS` for local throughput
   tuning.
+- `train.data` accepts multiple HDF5 dataset entries. `MetaDataset` provides
+  weighted sampling; with `normalize_weights_by_ds_size=true`, dataset-level
+  weights control expected source proportions instead of raw sequence counts.
+- `experiment.ckpt_path` initializes model and EMA weights for a new training
+  run with a fresh optimizer. `--resume` instead restores optimizer,
+  scheduler, epoch, and variable state from the latest checkpoint.
+- Action normalization is computed by the dataset before batches are created
+  and saved in checkpoints. Targeted fine-tuning must verify that correction
+  actions preserve the epoch-260 min-max coordinate system.
+- `experiment.save.latest_every_n_epochs` controls how often the resumable
+  `last.pth` / backup pair is rewritten; the final epoch is always saved.
 - The old forward-model implementation is intentionally absent. Use
   `outputs/eef_pose_osc_policy/README.md` in the parent repo for the current
   conclusion and `docs/forward_model_guidance_next_steps.md` only as an
@@ -117,15 +134,22 @@ horizons 2 / 16 / 8, min-max action normalization, and seed 500.
   `RolloutPolicy.action_normalization_stats`, then call
   `policy.policy.set_guidance_context(...)` after `start_episode` and before a
   new action chunk is sampled.
-- Guidance is DDIM-only, evaluates the executed `[:, 1:9]` clean-action slice,
-  and directly updates only that slice's XY delta-position coordinates.
+- The RGB guided variant uses DDIM. The guided LAN variant also accepts DDPM
+  scheduler outputs with a predicted clean sample. Both evaluate the executed
+  `[:, 1:9]` clean-action slice and directly update only that slice's XY
+  delta-position coordinates.
 
 ## 6. Guided-Denoising Verification
 
-Run the independent unit checks from the robomimic repo:
+Run the relevant unit checks from the parent repository:
 
 ```bash
-uv run python tests/test_guided_denoising_utils.py
+uv run pytest -q \
+  third_party/robomimic/tests/test_guided_denoising_utils.py \
+  third_party/robomimic/tests/test_lan_o3dp_pointcloud_core.py \
+  third_party/robomimic/tests/test_lan_o3dp_registration.py \
+  third_party/robomimic/tests/test_observation_min_max_normalization.py \
+  third_party/robomimic/tests/test_rollout_checkpoint_selection.py
 ```
 
 The tests cover reconstruction, point versus displacement normalization,
