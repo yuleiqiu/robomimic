@@ -63,7 +63,8 @@ class ConditionalResidualBlock1D(nn.Module):
             out_channels, 
             cond_dim,
             kernel_size=3,
-            n_groups=8):
+            n_groups=8,
+            cond_predict_scale=True):
         super().__init__()
 
         self.blocks = nn.ModuleList([
@@ -73,8 +74,9 @@ class ConditionalResidualBlock1D(nn.Module):
 
         # FiLM modulation https://arxiv.org/abs/1709.07871
         # predicts per-channel scale and bias
-        cond_channels = out_channels * 2
+        cond_channels = out_channels * 2 if cond_predict_scale else out_channels
         self.out_channels = out_channels
+        self.cond_predict_scale = cond_predict_scale
         self.cond_encoder = nn.Sequential(
             nn.Mish(),
             nn.Linear(cond_dim, cond_channels),
@@ -96,11 +98,14 @@ class ConditionalResidualBlock1D(nn.Module):
         out = self.blocks[0](x)
         embed = self.cond_encoder(cond)
 
-        embed = embed.reshape(
-            embed.shape[0], 2, self.out_channels, 1)
-        scale = embed[:,0,...]
-        bias = embed[:,1,...]
-        out = scale * out + bias
+        if self.cond_predict_scale:
+            embed = embed.reshape(
+                embed.shape[0], 2, self.out_channels, 1)
+            scale = embed[:,0,...]
+            bias = embed[:,1,...]
+            out = scale * out + bias
+        else:
+            out = out + embed
 
         out = self.blocks[1](out)
         out = out + self.residual_conv(x)
@@ -114,7 +119,8 @@ class ConditionalUnet1D(nn.Module):
         diffusion_step_embed_dim=256,
         down_dims=[256,512,1024],
         kernel_size=5,
-        n_groups=8
+        n_groups=8,
+        cond_predict_scale=True,
         ):
         """
         input_dim: Dim of actions.
@@ -125,6 +131,7 @@ class ConditionalUnet1D(nn.Module):
           The length of this array determines numebr of levels.
         kernel_size: Conv kernel size
         n_groups: Number of groups for GroupNorm
+        cond_predict_scale: If True, FiLM predicts both scale and bias.
         """
 
         super().__init__()
@@ -145,11 +152,13 @@ class ConditionalUnet1D(nn.Module):
         self.mid_modules = nn.ModuleList([
             ConditionalResidualBlock1D(
                 mid_dim, mid_dim, cond_dim=cond_dim,
-                kernel_size=kernel_size, n_groups=n_groups
+                kernel_size=kernel_size, n_groups=n_groups,
+                cond_predict_scale=cond_predict_scale,
             ),
             ConditionalResidualBlock1D(
                 mid_dim, mid_dim, cond_dim=cond_dim,
-                kernel_size=kernel_size, n_groups=n_groups
+                kernel_size=kernel_size, n_groups=n_groups,
+                cond_predict_scale=cond_predict_scale,
             ),
         ])
 
@@ -159,10 +168,12 @@ class ConditionalUnet1D(nn.Module):
             down_modules.append(nn.ModuleList([
                 ConditionalResidualBlock1D(
                     dim_in, dim_out, cond_dim=cond_dim, 
-                    kernel_size=kernel_size, n_groups=n_groups),
+                    kernel_size=kernel_size, n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale),
                 ConditionalResidualBlock1D(
                     dim_out, dim_out, cond_dim=cond_dim, 
-                    kernel_size=kernel_size, n_groups=n_groups),
+                    kernel_size=kernel_size, n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale),
                 Downsample1d(dim_out) if not is_last else nn.Identity()
             ]))
 
@@ -172,15 +183,17 @@ class ConditionalUnet1D(nn.Module):
             up_modules.append(nn.ModuleList([
                 ConditionalResidualBlock1D(
                     dim_out*2, dim_in, cond_dim=cond_dim,
-                    kernel_size=kernel_size, n_groups=n_groups),
+                    kernel_size=kernel_size, n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale),
                 ConditionalResidualBlock1D(
                     dim_in, dim_in, cond_dim=cond_dim,
-                    kernel_size=kernel_size, n_groups=n_groups),
+                    kernel_size=kernel_size, n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale),
                 Upsample1d(dim_in) if not is_last else nn.Identity()
             ]))
         
         final_conv = nn.Sequential(
-            Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size),
+            Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size, n_groups=n_groups),
             nn.Conv1d(start_dim, input_dim, 1),
         )
 

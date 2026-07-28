@@ -22,6 +22,14 @@ class GuidedDenoisingContext:
     normalize_waypoint_gradient: bool = False
     max_waypoint_displacement_m: Optional[float] = None
     norm_epsilon: float = 1e-6
+    cost_type: str = "penetration"
+    max_guidance_timestep: Optional[int] = None
+
+    def __post_init__(self):
+        if self.cost_type not in ("penetration", "vector_field"):
+            raise ValueError("Unsupported guidance cost type '{}'".format(self.cost_type))
+        if self.max_guidance_timestep is not None and self.max_guidance_timestep < 0:
+            raise ValueError("max_guidance_timestep must be non-negative when provided")
 
 
 @dataclass(frozen=True)
@@ -81,6 +89,8 @@ def guidance_context_from_rollout_policy(
     normalize_waypoint_gradient=False,
     max_waypoint_displacement_m=None,
     norm_epsilon=1e-6,
+    cost_type="penetration",
+    max_guidance_timestep=None,
 ):
     """Build a context using the exact statistics stored by ``RolloutPolicy``."""
 
@@ -101,6 +111,8 @@ def guidance_context_from_rollout_policy(
         normalize_waypoint_gradient=normalize_waypoint_gradient,
         max_waypoint_displacement_m=max_waypoint_displacement_m,
         norm_epsilon=norm_epsilon,
+        cost_type=cost_type,
+        max_guidance_timestep=max_guidance_timestep,
     )
 
 
@@ -179,6 +191,48 @@ def lan_xy_penetration_cost(
     return penetrations.sum(), penetrations, clearances
 
 
+def decaying_vector_field_cost(
+    waypoints,
+    obstacle_centers,
+    obstacle_radii,
+    *,
+    clearance_margin=0.02,
+    norm_epsilon=1e-6,
+):
+    """Radius-normalized decaying potential field.
+
+    Cost per waypoint-obstacle pair is ``R / 2 * (1 - d/R)^2`` when
+    ``d < R``, else zero. Away from the exact obstacle center, this gives a
+    radius-independent gradient magnitude ``1 - d/R``. The epsilon-safe norm
+    keeps the exact-center gradient finite (and therefore zero by symmetry).
+    """
+
+    centers = _as_reference_tensor(obstacle_centers, waypoints)
+    radii = _as_reference_tensor(obstacle_radii, waypoints).reshape(-1)
+    if centers.numel() == 0:
+        centers = centers.reshape(0, 2)
+    elif centers.ndim != 2 or centers.shape[-1] not in (2, 3):
+        raise ValueError("Obstacle centers must have shape [N, 2] or [N, 3]")
+    if centers.shape[0] != radii.shape[0]:
+        raise ValueError("Obstacle center and radius counts do not match")
+    if norm_epsilon <= 0:
+        raise ValueError("norm_epsilon must be positive")
+
+    if centers.shape[0] == 0:
+        empty = waypoints.new_zeros((waypoints.shape[0], waypoints.shape[1], 0))
+        return waypoints.sum() * 0.0, empty, empty
+
+    xy_delta = waypoints[..., :2].unsqueeze(2) - centers[:, :2].reshape(1, 1, -1, 2)
+    distances = torch.sqrt(torch.sum(xy_delta.square(), dim=-1) + norm_epsilon ** 2)
+    effective_radii = (radii + float(clearance_margin)).reshape(1, 1, -1)
+    if torch.any(effective_radii <= 0):
+        raise ValueError("Effective obstacle radii must be positive")
+    clearances = distances - effective_radii
+    normalized_depth = torch.relu(1.0 - distances / effective_radii)
+    cost_per_pair = 0.5 * effective_radii * normalized_depth.square()
+    return cost_per_pair.sum(), normalized_depth, clearances
+
+
 def waypoint_displacement_to_delta_update(current_eef_pos, waypoints, waypoint_displacement):
     """Difference pushed absolute waypoints back into executable delta actions."""
 
@@ -200,17 +254,39 @@ def waypoint_displacement_to_delta_update(current_eef_pos, waypoints, waypoint_d
 
 
 def previous_alpha_cumprod(noise_scheduler, timestep, reference):
-    """Get DDIM's alpha product for the previous inference timestep."""
+    """Get the alpha product at the next scheduler timestep.
+
+    This follows the scheduler's configured inference sequence, so it supports
+    both the legacy DDIM-10 policy and LAN-O3DP's DDPM-100 policy.
+    """
 
     if noise_scheduler.num_inference_steps is None:
         raise ValueError("Noise scheduler timesteps have not been initialized")
     timestep_int = int(timestep.item()) if torch.is_tensor(timestep) else int(timestep)
-    step_ratio = noise_scheduler.config.num_train_timesteps // noise_scheduler.num_inference_steps
-    previous_timestep = timestep_int - step_ratio
+    inference_timesteps = noise_scheduler.timesteps
+    matches = torch.nonzero(
+        inference_timesteps == timestep_int, as_tuple=False
+    ).reshape(-1)
+    if matches.numel() != 1:
+        raise ValueError(
+            "Timestep {} does not occur exactly once in the scheduler sequence".format(
+                timestep_int
+            )
+        )
+    index = int(matches.item())
+    previous_timestep = (
+        int(inference_timesteps[index + 1].item())
+        if index + 1 < len(inference_timesteps)
+        else -1
+    )
     if previous_timestep >= 0:
         alpha = noise_scheduler.alphas_cumprod[previous_timestep]
     else:
-        alpha = noise_scheduler.final_alpha_cumprod
+        alpha = getattr(
+            noise_scheduler,
+            "final_alpha_cumprod",
+            getattr(noise_scheduler, "one", 1.0),
+        )
     return previous_timestep, _as_reference_tensor(alpha, reference)
 
 
@@ -240,6 +316,13 @@ def apply_guidance_to_reverse_sample(
         return reverse_sample, None
     if predicted_clean_action.shape != reverse_sample.shape:
         raise ValueError("Predicted clean action and reverse sample shapes must match")
+
+    timestep_int = int(timestep.item()) if torch.is_tensor(timestep) else int(timestep)
+    if (
+        context.max_guidance_timestep is not None
+        and timestep_int > context.max_guidance_timestep
+    ):
+        return reverse_sample, None
 
     start = int(observation_horizon) - 1
     end = start + int(action_horizon)
@@ -288,7 +371,13 @@ def apply_guidance_to_reverse_sample(
 
     with torch.enable_grad():
         guidance_waypoints = waypoints.detach().requires_grad_(True)
-        cost, penetrations, clearances = lan_xy_penetration_cost(
+        if context.cost_type == "vector_field":
+            cost_fn = decaying_vector_field_cost
+        elif context.cost_type == "penetration":
+            cost_fn = lan_xy_penetration_cost
+        else:
+            raise ValueError("Unsupported guidance cost type '{}'".format(context.cost_type))
+        cost, penetrations, clearances = cost_fn(
             guidance_waypoints,
             centers,
             radii,
@@ -327,7 +416,7 @@ def apply_guidance_to_reverse_sample(
     full_update[:, start:end, :2] = normalized_xy_update
 
     with torch.no_grad():
-        resulting_cost, _, _ = lan_xy_penetration_cost(
+        resulting_cost, _, _ = cost_fn(
             waypoints + waypoint_displacement,
             centers,
             radii,
@@ -370,15 +459,24 @@ def guided_policy_from_checkpoint(device=None, ckpt_path=None, ckpt_dict=None, v
 
     source = FileUtils.maybe_dict_from_checkpoint(ckpt_path=ckpt_path, ckpt_dict=ckpt_dict)
     source_algo = source.get("algo_name")
-    if source_algo not in ("diffusion_policy", "guided_diffusion_policy"):
+    target_algos = {
+        "diffusion_policy": "guided_diffusion_policy",
+        "guided_diffusion_policy": "guided_diffusion_policy",
+        "lan_o3dp": "guided_lan_o3dp",
+        "guided_lan_o3dp": "guided_lan_o3dp",
+    }
+    if source_algo not in target_algos:
         raise ValueError(
-            "Expected a diffusion_policy checkpoint, got '{}'".format(source_algo)
+            "Expected a diffusion_policy or lan_o3dp checkpoint, got '{}'".format(
+                source_algo
+            )
         )
 
     adapted = dict(source)
     config_dict = json.loads(source["config"])
-    config_dict["algo_name"] = "guided_diffusion_policy"
-    adapted["algo_name"] = "guided_diffusion_policy"
+    target_algo = target_algos[source_algo]
+    config_dict["algo_name"] = target_algo
+    adapted["algo_name"] = target_algo
     adapted["config"] = json.dumps(config_dict)
 
     # policy_from_checkpoint converts these small nested lists in place.

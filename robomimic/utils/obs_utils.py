@@ -484,11 +484,18 @@ def normalize_dict(dict, normalization_stats):
         offset = normalization_stats[m]["offset"][0]
         scale = normalization_stats[m]["scale"][0]
 
-        # check shape consistency
+        # Check shape consistency with singleton statistic dimensions allowed
+        # to broadcast over reduced axes.
         o_num_dims = len(offset.shape)
-        shape_len_diff = len(offset.shape) - o_num_dims
+        shape_len_diff = dict[m].ndim - o_num_dims
         assert shape_len_diff >= 0, "shape length mismatch in @normalize_dict"
-        assert dict[m].shape[-o_num_dims:] == offset.shape, "shape mismatch in @normalize_obs"
+        trailing_shape = dict[m].shape[-o_num_dims:] if o_num_dims else ()
+        assert all(
+            stat_dim == 1 or stat_dim == obs_dim
+            for stat_dim, obs_dim in zip(offset.shape, trailing_shape)
+        ), "shape mismatch in @normalize_obs: obs {}, stats {}".format(
+            tuple(dict[m].shape), tuple(offset.shape)
+        )
 
         # Obs can have one or more leading batch dims - prepare for broadcasting.
         # 

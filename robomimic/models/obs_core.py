@@ -405,6 +405,59 @@ class DP3PointCloudCore(EncoderCore):
         return torch.max(hidden, dim=-2).values
 
 
+class LanO3DPPointCloudCore(EncoderCore):
+    """Point-cloud encoder used by the public LAN-O3DP execution path.
+
+    Inputs use robomimic's processed ``[B, 3, N]`` scan layout. The main
+    per-point branch is 3 -> 32 -> 64 -> 64, with LayerNorm and ReLU after
+    every layer. A separate linear shortcut maps the original XYZ directly to
+    64 dimensions. The summed features are max-pooled and projected through a
+    final Linear + LayerNorm without an output activation.
+    """
+
+    def __init__(self, input_shape):
+        super(LanO3DPPointCloudCore, self).__init__(input_shape=input_shape)
+        if len(input_shape) != 2 or input_shape[0] != 3:
+            raise ValueError(
+                "LanO3DPPointCloudCore expects processed scan shape (3, N), got {}".format(
+                    input_shape
+                )
+            )
+        self.main = nn.Sequential(
+            nn.Linear(3, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Linear(32, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+        )
+        self.shortcut = nn.Linear(3, 64)
+        self.projection = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.LayerNorm(64),
+        )
+
+    def output_shape(self, input_shape):
+        if len(input_shape) != 2 or input_shape[0] != 3:
+            raise ValueError("Expected input shape (3, N), got {}".format(input_shape))
+        return [64]
+
+    def forward(self, inputs):
+        if tuple(inputs.shape[-2:]) != tuple(self.input_shape):
+            raise ValueError(
+                "Expected trailing shape {}, got {}".format(
+                    tuple(self.input_shape), tuple(inputs.shape[-2:])
+                )
+            )
+        points = inputs.transpose(-1, -2)
+        point_features = self.main(points) + self.shortcut(points)
+        pooled = torch.max(point_features, dim=-2).values
+        return self.projection(pooled)
+
+
 """
 ================================================
 Observation Randomizer Networks

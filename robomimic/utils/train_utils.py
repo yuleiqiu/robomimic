@@ -174,6 +174,7 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
         action_keys=config.train.action_keys,
         dataset_keys=config.train.dataset_keys,
         action_config=config.train.action_config,
+        observation_config=config.train.get("observation_config", {}),
         load_next_obs=config.train.hdf5_load_next_obs, # whether to load next observations (s') from dataset
         frame_stack=config.train.frame_stack,
         seq_length=config.train.seq_length,
@@ -670,6 +671,16 @@ def save_model(model, config, env_meta, shape_meta, ckpt_path, variable_state=No
         params["action_normalization_stats"] = TensorUtils.to_list(action_normalization_stats)
     torch.save(params, ckpt_path)
     print("save checkpoint to {}".format(ckpt_path))
+
+
+def should_save_latest_model(epoch, num_epochs, every_n_epochs=1):
+    """Return whether to refresh the resumable latest checkpoint pair."""
+
+    if every_n_epochs is None:
+        return epoch == num_epochs
+    if every_n_epochs <= 0:
+        raise ValueError("latest_every_n_epochs must be positive or None")
+    return (epoch % every_n_epochs == 0) or (epoch == num_epochs)
 
 
 def run_epoch(model, data_loader, epoch, validate=False, num_steps=None, obs_normalization_stats=None):

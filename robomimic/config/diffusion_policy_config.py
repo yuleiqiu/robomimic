@@ -3,6 +3,7 @@ Config for Diffusion Policy algorithm.
 """
 
 from robomimic.config.base_config import BaseConfig
+from robomimic.config.config import Config
 
 class DiffusionPolicyConfig(BaseConfig):
     ALGO_NAME = "diffusion_policy"
@@ -42,6 +43,8 @@ class DiffusionPolicyConfig(BaseConfig):
         self.algo.optim_params.policy.learning_rate.epoch_schedule = [] # epochs where LR decay occurs (used by "linear" and "multistep" schedulers)
         self.algo.optim_params.policy.learning_rate.do_not_lock_keys()
         self.algo.optim_params.policy.regularization.L2 = 1e-6          # L2 regularization strength
+        self.algo.optim_params.policy.optimizer_kwargs = Config()
+        self.algo.optim_params.policy.optimizer_kwargs.do_not_lock_keys()
 
         # horizon parameters
         self.algo.horizon.observation_horizon = 2
@@ -54,6 +57,7 @@ class DiffusionPolicyConfig(BaseConfig):
         self.algo.unet.down_dims = [256,512,1024]
         self.algo.unet.kernel_size = 5
         self.algo.unet.n_groups = 8
+        self.algo.unet.cond_predict_scale = True
         
         # EMA parameters
         self.algo.ema.enabled = True

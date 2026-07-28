@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import torch
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 from robomimic.algo.algo import REGISTERED_ALGO_FACTORY_FUNCS
@@ -44,7 +45,63 @@ def make_context(**overrides):
 
 def test_registered_guided_variant():
     assert "guided_diffusion_policy" in REGISTERED_ALGO_FACTORY_FUNCS
+    assert "guided_lan_o3dp" in REGISTERED_ALGO_FACTORY_FUNCS
     assert "guided_diffusion_policy" in get_all_registered_configs()
+    assert "guided_lan_o3dp" in get_all_registered_configs()
+
+
+def test_previous_alpha_uses_actual_ddim_and_ddpm_inference_sequences():
+    reference = torch.zeros(())
+    ddim = make_scheduler()
+    previous, alpha = GuidedUtils.previous_alpha_cumprod(
+        ddim, ddim.timesteps[0], reference
+    )
+    assert previous == int(ddim.timesteps[1])
+    assert torch.allclose(alpha, ddim.alphas_cumprod[previous])
+
+    ddpm = DDPMScheduler(
+        num_train_timesteps=100,
+        beta_schedule="squaredcos_cap_v2",
+        clip_sample=True,
+        prediction_type="epsilon",
+    )
+    ddpm.set_timesteps(100)
+    previous, alpha = GuidedUtils.previous_alpha_cumprod(
+        ddpm, ddpm.timesteps[0], reference
+    )
+    assert previous == 98
+    assert torch.allclose(alpha, ddpm.alphas_cumprod[98])
+
+    previous, alpha = GuidedUtils.previous_alpha_cumprod(
+        ddpm, ddpm.timesteps[-1], reference
+    )
+    assert previous == -1
+    assert torch.allclose(alpha, ddpm.one)
+
+
+def test_ddpm_100_guidance_is_finite_and_changes_reverse_sample():
+    scheduler = DDPMScheduler(
+        num_train_timesteps=100,
+        beta_schedule="squaredcos_cap_v2",
+        clip_sample=True,
+        prediction_type="epsilon",
+    )
+    scheduler.set_timesteps(100)
+    predicted_clean = torch.zeros((1, 16, 7))
+    reverse_sample = torch.randn((1, 16, 7), generator=torch.Generator().manual_seed(17))
+    guided, diagnostics = GuidedUtils.apply_guidance_to_reverse_sample(
+        predicted_clean_action=predicted_clean,
+        reverse_sample=reverse_sample,
+        timestep=scheduler.timesteps[0],
+        noise_scheduler=scheduler,
+        context=make_context(max_waypoint_displacement_m=0.01),
+        observation_horizon=2,
+        action_horizon=8,
+    )
+    assert torch.all(torch.isfinite(guided))
+    assert torch.any(guided != reverse_sample)
+    assert diagnostics.previous_timestep == 98
+    assert diagnostics.max_waypoint_displacement_m <= 0.010001
 
 
 def test_delta_eef_reconstruction_matches_hand_computation():
@@ -99,6 +156,45 @@ def test_safe_waypoint_has_zero_cost_and_zero_gradient():
     cost.backward()
     assert torch.isclose(cost, torch.tensor(0.0))
     assert torch.equal(waypoint.grad, torch.zeros_like(waypoint))
+
+
+def test_vector_field_gradient_is_radius_normalized_and_decays_to_boundary():
+    gradient_norms = []
+    for radius in (0.04, 0.10):
+        waypoint = torch.tensor([[[radius * 0.5, 0.0, 0.0]]], requires_grad=True)
+        cost, depth, clearance = GuidedUtils.decaying_vector_field_cost(
+            waypoint,
+            obstacle_centers=torch.zeros((1, 3)),
+            obstacle_radii=torch.tensor([radius]),
+            clearance_margin=0.0,
+        )
+        cost.backward()
+        gradient_norms.append(torch.linalg.vector_norm(waypoint.grad))
+        assert torch.allclose(depth, torch.tensor([[[0.5]]]), atol=1e-5)
+        assert torch.allclose(clearance, torch.tensor([[[-radius * 0.5]]]), atol=1e-5)
+    assert torch.allclose(gradient_norms[0], torch.tensor(0.5), atol=1e-4)
+    assert torch.allclose(gradient_norms[0], gradient_norms[1], atol=1e-4)
+
+    safe = torch.tensor([[[0.11, 0.0, 0.0]]], requires_grad=True)
+    cost, depth, _ = GuidedUtils.decaying_vector_field_cost(
+        safe,
+        obstacle_centers=torch.zeros((1, 3)),
+        obstacle_radii=torch.tensor([0.10]),
+        clearance_margin=0.0,
+    )
+    cost.backward()
+    assert torch.isclose(cost, torch.tensor(0.0))
+    assert torch.equal(depth, torch.zeros_like(depth))
+    assert torch.equal(safe.grad, torch.zeros_like(safe))
+
+
+def test_vector_field_rejects_unknown_cost_type():
+    try:
+        make_context(cost_type="not_a_cost")
+    except ValueError as exc:
+        assert "Unsupported guidance cost type" in str(exc)
+    else:
+        raise AssertionError("Unknown guidance cost type should fail")
 
 
 def test_pushed_waypoints_difference_back_to_exact_delta_update():
@@ -196,13 +292,53 @@ def test_disabled_empty_safe_and_zero_scale_preserve_reverse_sample_exactly():
     assert diagnostics.normalized_applied_update_norm == 0.0
 
 
+def test_guidance_timestep_gate_and_waypoint_displacement_cap():
+    scheduler = make_scheduler()
+    predicted_clean = torch.zeros((1, 16, 7))
+    reverse_sample = torch.randn((1, 16, 7), generator=torch.Generator().manual_seed(13))
+    common = dict(
+        predicted_clean_action=predicted_clean,
+        reverse_sample=reverse_sample,
+        noise_scheduler=scheduler,
+        observation_horizon=2,
+        action_horizon=8,
+    )
+    context = make_context(
+        cost_type="vector_field",
+        guidance_scale=1.0,
+        max_guidance_timestep=20,
+        max_waypoint_displacement_m=0.03,
+    )
+
+    skipped, diagnostics = GuidedUtils.apply_guidance_to_reverse_sample(
+        timestep=scheduler.timesteps[0],
+        context=context,
+        **common,
+    )
+    assert skipped is reverse_sample
+    assert diagnostics is None
+
+    applied, diagnostics = GuidedUtils.apply_guidance_to_reverse_sample(
+        timestep=scheduler.timesteps[-1],
+        context=context,
+        **common,
+    )
+    assert torch.any(applied != reverse_sample)
+    assert diagnostics.max_waypoint_displacement_m <= 0.030001
+
+
 if __name__ == "__main__":
     test_registered_guided_variant()
+    test_previous_alpha_uses_actual_ddim_and_ddpm_inference_sequences()
+    test_ddpm_100_guidance_is_finite_and_changes_reverse_sample()
     test_delta_eef_reconstruction_matches_hand_computation()
     test_point_unnormalization_and_displacement_conversion_are_distinct()
     test_penetration_cost_is_unsquared_and_has_finite_gradient_at_zero_distance()
     test_safe_waypoint_has_zero_cost_and_zero_gradient()
+    test_vector_field_gradient_is_radius_normalized_and_decays_to_boundary()
+    test_vector_field_rejects_unknown_cost_type()
     test_pushed_waypoints_difference_back_to_exact_delta_update()
     test_guidance_changes_only_executed_xy_slice()
     test_disabled_empty_safe_and_zero_scale_preserve_reverse_sample_exactly()
+    test_guidance_timestep_gate_and_waypoint_displacement_cap()
     print("guided denoising utility checks passed")

@@ -536,12 +536,6 @@ class RolloutPolicy(object):
             ob = TensorUtils.to_batch(ob)
         ob = TensorUtils.to_device(ob, self.policy.device)
         ob = TensorUtils.to_float(ob)
-        if self.obs_normalization_stats is not None:
-            # ensure obs_normalization_stats are torch Tensors on proper device
-            obs_normalization_stats = TensorUtils.to_float(TensorUtils.to_device(TensorUtils.to_tensor(self.obs_normalization_stats), self.policy.device))
-            # limit normalization to obs keys being used, in case environment includes extra keys
-            ob = { k : ob[k] for k in self.policy.global_config.all_obs_keys }
-            ob = ObsUtils.normalize_dict(ob, normalization_stats=obs_normalization_stats)
         # Postprocess non-low-dimensional observations. Scan observations use
         # the same HDF5-to-network channel swap during online rollout as they
         # do in SequenceDataset.
@@ -553,6 +547,13 @@ class RolloutPolicy(object):
                     or ObsUtils.key_is_obs_modality(key=k, obs_modality="scan")
                 ):
                     ob[k] = ObsUtils.process_obs(obs=ob[k], obs_key=k)
+        if self.obs_normalization_stats is not None:
+            # Match training order: statistics are represented and applied in
+            # processed network layout.
+            obs_normalization_stats = TensorUtils.to_float(TensorUtils.to_device(TensorUtils.to_tensor(self.obs_normalization_stats), self.policy.device))
+            # limit normalization to obs keys being used, in case environment includes extra keys
+            ob = { k : ob[k] for k in self.policy.global_config.all_obs_keys }
+            ob = ObsUtils.normalize_dict(ob, normalization_stats=obs_normalization_stats)
         return ob
 
     def __repr__(self):

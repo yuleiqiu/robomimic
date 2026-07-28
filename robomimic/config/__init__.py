@@ -12,3 +12,5 @@ from robomimic.config.iris_config import IRISConfig
 from robomimic.config.td3_bc_config import TD3_BCConfig
 from robomimic.config.diffusion_policy_config import DiffusionPolicyConfig
 from robomimic.config.guided_diffusion_policy_config import GuidedDiffusionPolicyConfig
+from robomimic.config.lan_o3dp_config import LanO3DPConfig
+from robomimic.config.guided_lan_o3dp_config import GuidedLanO3DPConfig

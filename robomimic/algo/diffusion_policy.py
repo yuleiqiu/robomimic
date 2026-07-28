@@ -50,6 +50,11 @@ def algo_config_to_class(algo_config):
 
 
 class DiffusionPolicyUNet(PolicyAlgo):
+    def _obs_encoder_feature_activation(self):
+        """Activation applied by robomimic after each observation core."""
+
+        return nn.ReLU
+
     def _create_networks(self):
         """
         Creates networks and places them into @self.nets.
@@ -62,6 +67,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         obs_encoder = ObsNets.ObservationGroupEncoder(
             observation_group_shapes=observation_group_shapes,
             encoder_kwargs=encoder_kwargs,
+            feature_activation=self._obs_encoder_feature_activation(),
         )
         # IMPORTANT!
         # replace all BatchNorm with GroupNorm to work with EMA
@@ -73,7 +79,12 @@ class DiffusionPolicyUNet(PolicyAlgo):
         # create network object
         noise_pred_net = DPNets.ConditionalUnet1D(
             input_dim=self.ac_dim,
-            global_cond_dim=obs_dim*self.algo_config.horizon.observation_horizon
+            global_cond_dim=obs_dim*self.algo_config.horizon.observation_horizon,
+            diffusion_step_embed_dim=self.algo_config.unet.diffusion_step_embed_dim,
+            down_dims=list(self.algo_config.unet.down_dims),
+            kernel_size=self.algo_config.unet.kernel_size,
+            n_groups=self.algo_config.unet.n_groups,
+            cond_predict_scale=self.algo_config.unet.get("cond_predict_scale", True),
         )
 
         # the final arch has 2 parts

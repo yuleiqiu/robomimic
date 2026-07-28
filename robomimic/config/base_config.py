@@ -99,6 +99,9 @@ class BaseConfig(Config):
         # If enabled, equal rollout success is broken by lower current validation
         # loss. An exact second tie keeps the earlier epoch.
         self.experiment.save.rollout_success_tiebreak_validation = False
+        # Frequency for the resumable last.pth + last_bak.pth pair. The final
+        # epoch is always saved. Default 1 preserves historical behavior.
+        self.experiment.save.latest_every_n_epochs = 1
 
         # epoch definitions - if not None, set an epoch to be this many gradient steps, else the full dataset size will be used
         self.experiment.epoch_every_n_steps = 100                   # number of gradient steps in train epoch (None for full dataset pass)
@@ -228,6 +231,14 @@ class BaseConfig(Config):
                 "normalization": None
             }
         }
+
+        # Optional per-observation normalization settings. When
+        # @hdf5_normalize_obs is enabled, entries can select "gaussian" or
+        # "min_max" normalization and the number of trailing raw observation
+        # dimensions to preserve while reducing statistics. An empty mapping
+        # retains the legacy per-element Gaussian behavior.
+        self.train.observation_config = Config()
+        self.train.observation_config.do_not_lock_keys()
 
         # one of [None, "last"] - set to "last" to include goal observations in each batch
         self.train.goal_mode = None

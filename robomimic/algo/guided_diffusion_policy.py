@@ -1,7 +1,5 @@
 """Registered deployment-time guided variant of Diffusion Policy."""
 
-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-
 from robomimic.algo import register_algo_factory_func
 from robomimic.algo.diffusion_policy import DiffusionPolicyUNet
 from robomimic.utils.guided_denoising_utils import apply_guidance_to_reverse_sample
@@ -11,6 +9,15 @@ from robomimic.utils.guided_denoising_utils import apply_guidance_to_reverse_sam
 def algo_config_to_class(algo_config):
     if algo_config.unet.enabled:
         return GuidedDiffusionPolicyUNet, {}
+    if algo_config.transformer.enabled:
+        raise NotImplementedError()
+    raise RuntimeError()
+
+
+@register_algo_factory_func("guided_lan_o3dp")
+def lan_algo_config_to_class(algo_config):
+    if algo_config.unet.enabled:
+        return GuidedLanO3DPUNet, {}
     if algo_config.transformer.enabled:
         raise NotImplementedError()
     raise RuntimeError()
@@ -57,8 +64,10 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
         context = self.guidance_context
         if context is None or not context.enabled:
             return step_output.prev_sample
-        if not isinstance(self.noise_scheduler, DDIMScheduler):
-            raise ValueError("guided_diffusion_policy currently supports DDIM only")
+        if not hasattr(step_output, "pred_original_sample") or step_output.pred_original_sample is None:
+            raise ValueError(
+                "guided_diffusion_policy requires the scheduler to return pred_original_sample"
+            )
 
         guided_sample, diagnostics = apply_guidance_to_reverse_sample(
             predicted_clean_action=step_output.pred_original_sample,
@@ -72,3 +81,10 @@ class GuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
         if diagnostics is not None:
             self.guidance_diagnostics.append(diagnostics)
         return guided_sample
+
+
+class GuidedLanO3DPUNet(GuidedDiffusionPolicyUNet):
+    """Guided LAN-O3DP variant that preserves its linear encoder fusion."""
+
+    def _obs_encoder_feature_activation(self):
+        return None

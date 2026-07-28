@@ -1,6 +1,9 @@
 import unittest
 
-from robomimic.utils.train_utils import should_save_from_rollout_logs
+from robomimic.utils.train_utils import (
+    should_save_from_rollout_logs,
+    should_save_latest_model,
+)
 
 
 class TestRolloutCheckpointSelection(unittest.TestCase):
@@ -34,6 +37,12 @@ class TestRolloutCheckpointSelection(unittest.TestCase):
         result = self.select(0.9, 1.0, 20, 0.9, 1.0, 10)
         self.assertFalse(result["should_save_ckpt"])
         self.assertEqual(result["best_success_epoch"]["env"], 10)
+
+    def test_latest_checkpoint_interval_and_final_epoch(self):
+        self.assertFalse(should_save_latest_model(1, 500, 50))
+        self.assertTrue(should_save_latest_model(50, 500, 50))
+        self.assertTrue(should_save_latest_model(500, 500, 50))
+        self.assertTrue(should_save_latest_model(499, 499, 50))
 
 
 if __name__ == "__main__":

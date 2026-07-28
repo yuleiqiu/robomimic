@@ -107,19 +107,30 @@ def optimizer_from_optim_params(net_optim_params, net):
     """
     optimizer_type = net_optim_params.get("optimizer_type", "adam")
     lr = net_optim_params["learning_rate"]["initial"]
+    optimizer_kwargs = dict(net_optim_params.get("optimizer_kwargs", {}))
+    if "betas" in optimizer_kwargs:
+        optimizer_kwargs["betas"] = tuple(optimizer_kwargs["betas"])
+    reserved_kwargs = {"params", "lr", "weight_decay"}.intersection(optimizer_kwargs)
+    if reserved_kwargs:
+        raise ValueError(
+            "optimizer_kwargs cannot override {}".format(sorted(reserved_kwargs))
+        )
 
     if optimizer_type == "adam":
         return optim.Adam(
             params=net.parameters(),
             lr=lr,
             weight_decay=net_optim_params["regularization"]["L2"],
+            **optimizer_kwargs,
         )
     elif optimizer_type == "adamw":
         return optim.AdamW(
             params=net.parameters(),
             lr=lr,
             weight_decay=net_optim_params["regularization"]["L2"],
+            **optimizer_kwargs,
         )
+    raise ValueError("Unsupported optimizer type: {}".format(optimizer_type))
 
 
 def lr_scheduler_from_optim_params(net_optim_params, net, optimizer):

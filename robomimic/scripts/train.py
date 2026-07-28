@@ -207,20 +207,20 @@ def train(config, device, resume=False):
         if "optim_params" in config.algo:
             # add info to optim_params of each net
             for k in config.algo.optim_params:
-                config.algo.optim_params[k]["num_train_batches"] = len(trainset) if train_num_steps is None else train_num_steps
+                config.algo.optim_params[k]["num_train_batches"] = len(train_loader) if train_num_steps is None else train_num_steps
                 config.algo.optim_params[k]["num_epochs"] = config.train.num_epochs
         # handling for "hbc" and "iris" algorithms
         if config.algo_name == "hbc":
             for sub_algo in ["planner", "actor"]:
                 # add info to optim_params of each net
                 for k in config.algo[sub_algo].optim_params:
-                    config.algo[sub_algo].optim_params[k]["num_train_batches"] = len(trainset) if train_num_steps is None else train_num_steps
+                    config.algo[sub_algo].optim_params[k]["num_train_batches"] = len(train_loader) if train_num_steps is None else train_num_steps
                     config.algo[sub_algo].optim_params[k]["num_epochs"] = config.train.num_epochs
         if config.algo_name == "iris":
             for sub_algo in ["planner", "value"]:
                 # add info to optim_params of each net
                 for k in config.algo["value_planner"][sub_algo].optim_params:
-                    config.algo["value_planner"][sub_algo].optim_params[k]["num_train_batches"] = len(trainset) if train_num_steps is None else train_num_steps
+                    config.algo["value_planner"][sub_algo].optim_params[k]["num_train_batches"] = len(train_loader) if train_num_steps is None else train_num_steps
                     config.algo["value_planner"][sub_algo].optim_params[k]["num_epochs"] = config.train.num_epochs
 
     # setup for a new training run
@@ -465,22 +465,31 @@ def train(config, device, resume=False):
                 action_normalization_stats=action_normalization_stats,
             )
 
-        # always save latest model for resume functionality
-        print("\nsaving latest model at {}...\n".format(latest_model_path))
-        TrainUtils.save_model(
-            model=model,
-            config=config,
-            env_meta=env_meta_list[0] if len(env_meta_list)==1 else env_meta_list,
-            shape_meta=shape_meta_list[0] if len(shape_meta_list)==1 else shape_meta_list,
-            variable_state=variable_state,
-            ckpt_path=latest_model_path,
-            obs_normalization_stats=obs_normalization_stats,
-            action_normalization_stats=action_normalization_stats,
-        )
+        # Save the resumable latest pair at a configurable frequency. Large
+        # policies can otherwise spend more time rewriting checkpoints than
+        # training. The default interval of one preserves historical behavior.
+        if TrainUtils.should_save_latest_model(
+            epoch=epoch,
+            num_epochs=config.train.num_epochs,
+            every_n_epochs=config.experiment.save.get(
+                "latest_every_n_epochs", 1
+            ),
+        ):
+            print("\nsaving latest model at {}...\n".format(latest_model_path))
+            TrainUtils.save_model(
+                model=model,
+                config=config,
+                env_meta=env_meta_list[0] if len(env_meta_list)==1 else env_meta_list,
+                shape_meta=shape_meta_list[0] if len(shape_meta_list)==1 else shape_meta_list,
+                variable_state=variable_state,
+                ckpt_path=latest_model_path,
+                obs_normalization_stats=obs_normalization_stats,
+                action_normalization_stats=action_normalization_stats,
+            )
 
-        # keep a backup model in case last.pth is malformed (e.g. job died last time during saving)
-        shutil.copyfile(latest_model_path, latest_model_backup_path)
-        print("\nsaved backup of latest model at {}\n".format(latest_model_backup_path))
+            # keep a backup model in case last.pth is malformed (e.g. job died last time during saving)
+            shutil.copyfile(latest_model_path, latest_model_backup_path)
+            print("\nsaved backup of latest model at {}\n".format(latest_model_backup_path))
 
         # Finally, log memory usage in MB
         process = psutil.Process(os.getpid())

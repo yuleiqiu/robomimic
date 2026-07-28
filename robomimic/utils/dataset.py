@@ -27,6 +27,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         action_keys,
         dataset_keys,
         action_config,
+        observation_config=None,
         frame_stack=1,
         seq_length=1,
         pad_frame_stack=True,
@@ -51,6 +52,9 @@ class SequenceDataset(torch.utils.data.Dataset):
             obs_keys (tuple, list): keys to observation items (image, object, etc) to be fetched from the dataset
 
             action_config (dict): specifing each action keys to load and their corresponding normalization/conversion requirement
+
+            observation_config (dict): optional per-observation normalization
+                settings with ``normalization`` and ``last_n_dims`` entries.
 
             dataset_keys (tuple, list): keys to dataset items (actions, rewards, etc) to be fetched from the dataset
 
@@ -122,6 +126,9 @@ class SequenceDataset(torch.utils.data.Dataset):
             self.dataset_keys = tuple(set(self.dataset_keys).union(set(self.action_keys)))
 
         self.action_config = action_config
+        self.observation_config = (
+            {} if observation_config is None else deepcopy(observation_config)
+        )
 
         self.n_frame_stack = frame_stack
         assert self.n_frame_stack >= 1
@@ -338,25 +345,68 @@ class SequenceDataset(torch.utils.data.Dataset):
         (per dimension and per obs key) and returns it.
         """
 
-        # Run through all trajectories. For each one, compute minimal observation statistics, and then aggregate
-        # with the previous statistics.
+        # Preserve historical behavior exactly when no per-key configuration
+        # is supplied.
+        if not self.observation_config:
+            return self._normalize_obs_legacy()
+
+        # Configured statistics are computed in raw HDF5 layout so that
+        # last_n_dims refers to the natural observation layout (for example,
+        # [T, points, XYZ]). Returned statistics are transformed to network
+        # layout because both training and rollout normalize after processing.
         ep = self.demos[0]
         obs_traj = {k: self.hdf5_file["data/{}/obs/{}".format(ep, k)][()].astype('float32') for k in self.obs_keys}
+        merged_stats = _compute_traj_stats_with_config(
+            obs_traj, self.observation_config
+        )
+        print("SequenceDataset: normalizing observations...")
+        for ep in LogUtils.custom_tqdm(self.demos[1:]):
+            obs_traj = {k: self.hdf5_file["data/{}/obs/{}".format(ep, k)][()].astype('float32') for k in self.obs_keys}
+            traj_stats = _compute_traj_stats_with_config(
+                obs_traj, self.observation_config
+            )
+            merged_stats = _aggregate_traj_stats(merged_stats, traj_stats)
+
+        normalization_stats = observation_stats_to_normalization_stats(
+            merged_stats, self.observation_config
+        )
+        for key, stats in normalization_stats.items():
+            for stat_name in ("offset", "scale"):
+                stats[stat_name] = ObsUtils.process_obs(
+                    obs=stats[stat_name],
+                    obs_key=key,
+                )
+        return normalization_stats
+
+    def _normalize_obs_legacy(self):
+        ep = self.demos[0]
+        obs_traj = {
+            k: self.hdf5_file["data/{}/obs/{}".format(ep, k)][()].astype("float32")
+            for k in self.obs_keys
+        }
         obs_traj = ObsUtils.process_obs_dict(obs_traj)
         merged_stats = _compute_traj_stats(obs_traj)
         print("SequenceDataset: normalizing observations...")
         for ep in LogUtils.custom_tqdm(self.demos[1:]):
-            obs_traj = {k: self.hdf5_file["data/{}/obs/{}".format(ep, k)][()].astype('float32') for k in self.obs_keys}
+            obs_traj = {
+                k: self.hdf5_file["data/{}/obs/{}".format(ep, k)][()].astype("float32")
+                for k in self.obs_keys
+            }
             obs_traj = ObsUtils.process_obs_dict(obs_traj)
-            traj_stats = _compute_traj_stats(obs_traj)
-            merged_stats = _aggregate_traj_stats(merged_stats, traj_stats)
+            merged_stats = _aggregate_traj_stats(
+                merged_stats, _compute_traj_stats(obs_traj)
+            )
 
-        obs_normalization_stats = { k : {} for k in merged_stats }
-        for k in merged_stats:
-            # note we add a small tolerance of 1e-3 for std
-            obs_normalization_stats[k]["offset"] = merged_stats[k]["mean"].astype(np.float32)
-            obs_normalization_stats[k]["scale"] = (np.sqrt(merged_stats[k]["sqdiff"] / merged_stats[k]["n"]) + 1e-3).astype(np.float32)
-        return obs_normalization_stats
+        normalization_stats = {key: {} for key in merged_stats}
+        for key in merged_stats:
+            normalization_stats[key]["offset"] = merged_stats[key]["mean"].astype(
+                np.float32
+            )
+            normalization_stats[key]["scale"] = (
+                np.sqrt(merged_stats[key]["sqdiff"] / merged_stats[key]["n"])
+                + 1e-3
+            ).astype(np.float32)
+        return normalization_stats
 
     def get_obs_normalization_stats(self):
         """
@@ -816,6 +866,37 @@ def _compute_traj_stats(traj_obs_dict):
         traj_stats[k]["max"] = traj_obs_dict[k].max(axis=0, keepdims=True)
     return traj_stats
 
+
+def _compute_traj_stats_with_config(traj_obs_dict, observation_config):
+    """Compute statistics while retaining configured trailing dimensions."""
+
+    traj_stats = {key: {} for key in traj_obs_dict}
+    for key, values in traj_obs_dict.items():
+        key_config = observation_config.get(key, {})
+        last_n_dims = int(key_config.get("last_n_dims", values.ndim - 1))
+        if last_n_dims < 0 or last_n_dims > values.ndim - 1:
+            raise ValueError(
+                "last_n_dims for {} must be between 0 and {}, got {}".format(
+                    key, values.ndim - 1, last_n_dims
+                )
+            )
+        reduction_axes = tuple(range(values.ndim - last_n_dims))
+        n = int(np.prod([values.shape[axis] for axis in reduction_axes]))
+        mean = values.mean(axis=reduction_axes, keepdims=True)
+        traj_stats[key]["n"] = n
+        traj_stats[key]["mean"] = mean
+        traj_stats[key]["sqdiff"] = (
+            (values - mean) ** 2
+        ).sum(axis=reduction_axes, keepdims=True)
+        traj_stats[key]["min"] = values.min(
+            axis=reduction_axes, keepdims=True
+        )
+        traj_stats[key]["max"] = values.max(
+            axis=reduction_axes, keepdims=True
+        )
+    return traj_stats
+
+
 def _aggregate_traj_stats(traj_stats_a, traj_stats_b):
     """
     Helper function to aggregate trajectory statistics.
@@ -913,3 +994,46 @@ def action_stats_to_normalization_stats(action_stats, action_config):
                 'action_config.actions.normalization: "{}" is not supported'.format(norm_method))
     
     return action_normalization_stats
+
+
+def observation_stats_to_normalization_stats(observation_stats, observation_config):
+    """Convert observation statistics into scale and offset."""
+
+    normalization_stats = OrderedDict()
+    for key, stats in observation_stats.items():
+        norm_method = observation_config.get(key, {}).get(
+            "normalization", "gaussian"
+        )
+        if norm_method is None:
+            scale = np.ones_like(stats["mean"], dtype=np.float32)
+            offset = np.zeros_like(stats["mean"], dtype=np.float32)
+        elif norm_method == "gaussian":
+            offset = stats["mean"].astype(np.float32)
+            scale = (
+                np.sqrt(stats["sqdiff"] / stats["n"]) + 1e-3
+            ).astype(np.float32)
+        elif norm_method == "min_max":
+            input_min = stats["min"].astype(np.float32)
+            input_max = stats["max"].astype(np.float32)
+            output_min = -0.999999
+            output_max = 0.999999
+            input_range = input_max - input_min
+            ignore_dim = input_range < 1e-4
+            safe_range = input_range.copy()
+            safe_range[ignore_dim] = output_max - output_min
+            scale = safe_range / (output_max - output_min)
+            offset = input_min - scale * output_min
+            offset[ignore_dim] = (
+                input_min[ignore_dim] - (output_max + output_min) / 2
+            )
+        else:
+            raise NotImplementedError(
+                'observation_config.{}.normalization: "{}" is not supported'.format(
+                    key, norm_method
+                )
+            )
+        normalization_stats[key] = {
+            "scale": scale.astype(np.float32),
+            "offset": offset.astype(np.float32),
+        }
+    return normalization_stats
