@@ -726,6 +726,361 @@ class SequenceDataset(torch.utils.data.Dataset):
         return None
 
 
+class PairedCorrectionDataset(torch.utils.data.Dataset):
+    """
+    Dataset adapter for pre-extracted paired-correction windows.
+
+    The pair file stores exactly the tensors consumed by Diffusion Policy:
+    ``observation_horizon`` observations and ``prediction_horizon`` actions.
+    A standard :class:`SequenceDataset` returns
+    ``frame_stack - 1 + seq_length`` entries for every key before
+    ``DiffusionPolicyUNet.process_batch_for_training`` truncates observations
+    and actions. To collate clean and correction samples in the same batch,
+    this adapter repeats the final stored value to that standard pre-truncation
+    length. Only the stored 2 observations and 16 actions are consumed.
+    """
+
+    SCHEMA_VERSION = "paired-correction-pairs-v1"
+
+    def __init__(
+        self,
+        hdf5_path,
+        obs_keys,
+        action_keys,
+        dataset_keys,
+        action_config,
+        frame_stack,
+        seq_length,
+        filter_by_attribute=None,
+        positive_action_key="positive_actions",
+        negative_action_key="negative_actions",
+        return_negative_actions=False,
+        cache_in_memory=False,
+        hdf5_use_swmr=True,
+        **unused_kwargs,
+    ):
+        super(PairedCorrectionDataset, self).__init__()
+        if len(action_keys) != 1:
+            raise ValueError(
+                "PairedCorrectionDataset currently requires exactly one "
+                "action key"
+            )
+        self.hdf5_path = os.path.expanduser(hdf5_path)
+        self.hdf5_use_swmr = hdf5_use_swmr
+        self._hdf5_file = None
+        self.obs_keys = tuple(obs_keys)
+        self.action_keys = tuple(action_keys)
+        self.action_key = self.action_keys[0]
+        self.dataset_keys = tuple(dataset_keys)
+        self.action_config = action_config
+        self.positive_action_key = positive_action_key
+        self.negative_action_key = negative_action_key
+        self.return_negative_actions = bool(return_negative_actions)
+        self.filter_by_attribute = filter_by_attribute
+        self.cache_in_memory = bool(cache_in_memory)
+        self.n_frame_stack = int(frame_stack)
+        self.seq_length = int(seq_length)
+        self.output_sequence_length = self.n_frame_stack - 1 + self.seq_length
+        self.hdf5_cache_mode = (
+            "paired_raw_all" if self.cache_in_memory else None
+        )
+        self.action_normalization_stats = None
+        self.obs_cache = None
+        self.positive_action_cache = None
+        self.negative_action_cache = None
+
+        with self.hdf5_file_opened():
+            schema = self.hdf5_file.attrs.get("schema_version", "")
+            if schema != self.SCHEMA_VERSION:
+                raise ValueError(
+                    "Expected schema {}, got {}".format(
+                        self.SCHEMA_VERSION, schema
+                    )
+                )
+            stored_obs_horizon = int(
+                self.hdf5_file.attrs["observation_horizon"]
+            )
+            stored_prediction_horizon = int(
+                self.hdf5_file.attrs["prediction_horizon"]
+            )
+            if stored_obs_horizon != self.n_frame_stack:
+                raise ValueError(
+                    "Pair observation horizon {} does not match frame_stack "
+                    "{}".format(stored_obs_horizon, self.n_frame_stack)
+                )
+            if stored_prediction_horizon != self.seq_length:
+                raise ValueError(
+                    "Pair prediction horizon {} does not match seq_length "
+                    "{}".format(stored_prediction_horizon, self.seq_length)
+                )
+            missing_obs = set(self.obs_keys) - set(
+                self.hdf5_file["pairs/obs"].keys()
+            )
+            if missing_obs:
+                raise KeyError(
+                    "Pair file is missing observations: {}".format(
+                        sorted(missing_obs)
+                    )
+                )
+            if "pairs/{}".format(self.positive_action_key) not in self.hdf5_file:
+                raise KeyError(self.positive_action_key)
+            if (
+                self.return_negative_actions
+                and "pairs/{}".format(self.negative_action_key)
+                not in self.hdf5_file
+            ):
+                raise KeyError(self.negative_action_key)
+
+            episode_ids = _decode_hdf5_strings(
+                self.hdf5_file["pairs/episode_id"][()]
+            )
+            if filter_by_attribute is None:
+                self.indices = np.arange(len(episode_ids), dtype=np.int64)
+            else:
+                mask_key = _paired_correction_mask_key(
+                    self.hdf5_file, filter_by_attribute
+                )
+                selected_episode_ids = set(
+                    _decode_hdf5_strings(self.hdf5_file[mask_key][()])
+                )
+                self.indices = np.flatnonzero(
+                    np.asarray(
+                        [
+                            episode_id in selected_episode_ids
+                            for episode_id in episode_ids
+                        ],
+                        dtype=bool,
+                    )
+                )
+            if len(self.indices) == 0:
+                raise ValueError(
+                    "No paired corrections selected by filter {!r}".format(
+                        filter_by_attribute
+                    )
+                )
+            if self.cache_in_memory:
+                print(
+                    "PairedCorrectionDataset: caching {} raw pairs in "
+                    "memory...".format(len(self.indices))
+                )
+                self.obs_cache = {
+                    key: self.hdf5_file[
+                        "pairs/obs/{}".format(key)
+                    ][self.indices]
+                    for key in self.obs_keys
+                }
+                self.positive_action_cache = self.hdf5_file[
+                    "pairs/{}".format(self.positive_action_key)
+                ][self.indices].astype(np.float32)
+                if self.return_negative_actions:
+                    self.negative_action_cache = self.hdf5_file[
+                        "pairs/{}".format(self.negative_action_key)
+                    ][self.indices].astype(np.float32)
+
+    @property
+    def hdf5_file(self):
+        if self._hdf5_file is None:
+            self._hdf5_file = h5py.File(
+                self.hdf5_path,
+                "r",
+                swmr=self.hdf5_use_swmr,
+                libver="latest",
+            )
+        return self._hdf5_file
+
+    def close_and_delete_hdf5_handle(self):
+        if self._hdf5_file is not None:
+            self._hdf5_file.close()
+        self._hdf5_file = None
+
+    @contextmanager
+    def hdf5_file_opened(self):
+        should_close = self._hdf5_file is None
+        yield self.hdf5_file
+        if should_close:
+            self.close_and_delete_hdf5_handle()
+
+    def __del__(self):
+        self.close_and_delete_hdf5_handle()
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __repr__(self):
+        return (
+            "PairedCorrectionDataset ("
+            "\n\tpath={}"
+            "\n\tobs_keys={}"
+            "\n\tfilter_key={}"
+            "\n\tnum_pairs={}"
+            "\n\tstored_horizons={}/{}"
+            "\n\tcollation_length={}"
+            "\n\tcache_in_memory={}"
+            "\n\treturn_negative_actions={}"
+            "\n)"
+        ).format(
+            self.hdf5_path,
+            self.obs_keys,
+            self.filter_by_attribute,
+            len(self),
+            self.n_frame_stack,
+            self.seq_length,
+            self.output_sequence_length,
+            self.cache_in_memory,
+            self.return_negative_actions,
+        )
+
+    @staticmethod
+    def _pad_last(values, output_length):
+        if values.shape[0] > output_length:
+            raise ValueError(
+                "Stored sequence length {} exceeds output length {}".format(
+                    values.shape[0], output_length
+                )
+            )
+        if values.shape[0] == output_length:
+            return values
+        repeats = output_length - values.shape[0]
+        return np.concatenate(
+            [values, np.repeat(values[-1:], repeats, axis=0)],
+            axis=0,
+        )
+
+    def __getitem__(self, index):
+        source_index = int(self.indices[index])
+        if self.cache_in_memory:
+            obs = {
+                key: self._pad_last(
+                    self.obs_cache[key][index],
+                    self.output_sequence_length,
+                )
+                for key in self.obs_keys
+            }
+            raw_actions = self.positive_action_cache[index]
+            raw_negative_actions = (
+                self.negative_action_cache[index]
+                if self.return_negative_actions
+                else None
+            )
+        else:
+            obs = {
+                key: self._pad_last(
+                    self.hdf5_file[
+                        "pairs/obs/{}".format(key)
+                    ][source_index],
+                    self.output_sequence_length,
+                )
+                for key in self.obs_keys
+            }
+            raw_actions = self.hdf5_file[
+                "pairs/{}".format(self.positive_action_key)
+            ][source_index].astype(np.float32)
+            raw_negative_actions = (
+                self.hdf5_file[
+                    "pairs/{}".format(self.negative_action_key)
+                ][source_index].astype(np.float32)
+                if self.return_negative_actions
+                else None
+            )
+        padded_actions = self._pad_last(
+            raw_actions, self.output_sequence_length
+        )
+
+        action_dict = OrderedDict([(self.action_key, padded_actions)])
+        action_dict = ObsUtils.normalize_dict(
+            action_dict,
+            normalization_stats=self.get_action_normalization_stats(),
+        )
+        output = {
+            "obs": obs,
+            self.action_key: padded_actions,
+            "actions": PyUtils.action_dict_to_vector(action_dict),
+            "index": index,
+        }
+        if self.return_negative_actions:
+            padded_negative_actions = self._pad_last(
+                raw_negative_actions,
+                self.output_sequence_length,
+            )
+            negative_action_dict = OrderedDict(
+                [(self.action_key, padded_negative_actions)]
+            )
+            negative_action_dict = ObsUtils.normalize_dict(
+                negative_action_dict,
+                normalization_stats=self.get_action_normalization_stats(),
+            )
+            output["negative_actions"] = PyUtils.action_dict_to_vector(
+                negative_action_dict
+            )
+            output["is_paired_correction"] = np.float32(1.0)
+        for key in self.dataset_keys:
+            if key in output:
+                continue
+            if key in ("rewards", "dones"):
+                output[key] = np.zeros(
+                    (self.output_sequence_length,), dtype=np.float32
+                )
+            else:
+                output[key] = np.zeros(
+                    (self.output_sequence_length, 1), dtype=np.float32
+                )
+        return output
+
+    def get_action_stats(self):
+        if self.cache_in_memory:
+            actions = self.positive_action_cache
+        else:
+            actions = self.hdf5_file[
+                "pairs/{}".format(self.positive_action_key)
+            ][self.indices].astype(np.float32)
+        return _compute_traj_stats(
+            {self.action_key: actions.reshape(-1, actions.shape[-1])}
+        )
+
+    def get_negative_action_stats(self):
+        if self.cache_in_memory and self.negative_action_cache is not None:
+            actions = self.negative_action_cache
+        else:
+            actions = self.hdf5_file[
+                "pairs/{}".format(self.negative_action_key)
+            ][self.indices].astype(np.float32)
+        return _compute_traj_stats(
+            {self.action_key: actions.reshape(-1, actions.shape[-1])}
+        )
+
+    def set_action_normalization_stats(self, action_normalization_stats):
+        self.action_normalization_stats = action_normalization_stats
+
+    def get_action_normalization_stats(self):
+        if self.action_normalization_stats is None:
+            self.action_normalization_stats = action_stats_to_normalization_stats(
+                self.get_action_stats(), self.action_config
+            )
+        return self.action_normalization_stats
+
+    def get_dataset_sampler(self):
+        return None
+
+
+def _decode_hdf5_strings(values):
+    return [
+        value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        for value in values
+    ]
+
+
+def _paired_correction_mask_key(hdf5_file, filter_by_attribute):
+    direct_key = "mask/{}".format(filter_by_attribute)
+    episode_key = "mask/{}_episode_ids".format(filter_by_attribute)
+    if direct_key in hdf5_file:
+        return direct_key
+    if episode_key in hdf5_file:
+        return episode_key
+    raise KeyError(
+        "Pair file has no split mask for {!r}".format(filter_by_attribute)
+    )
+
+
 class CustomWeightedRandomSampler(torch.utils.data.WeightedRandomSampler):
     def __init__(self, *args, **kwargs):
         """
@@ -779,6 +1134,10 @@ class MetaDataset(torch.utils.data.Dataset):
         else:
             self.ds_weights = ds_weights
         self._ds_ind_bins = np.cumsum([0] + list(ds_lens))
+        self.return_negative_actions = any(
+            getattr(dataset, "return_negative_actions", False)
+            for dataset in self.datasets
+        )
 
         # cache mode "all" not supported! The action normalization stats of each
         # dataset will change after the datasets are already initialized
@@ -797,6 +1156,13 @@ class MetaDataset(torch.utils.data.Dataset):
         ds_ind = np.digitize(idx, self._ds_ind_bins) - 1
         ind_in_ds = idx - self._ds_ind_bins[ds_ind]
         meta = self.datasets[ds_ind].__getitem__(ind_in_ds)
+        if self.return_negative_actions:
+            if "negative_actions" not in meta:
+                meta["negative_actions"] = np.asarray(
+                    meta["actions"]
+                ).copy()
+            if "is_paired_correction" not in meta:
+                meta["is_paired_correction"] = np.float32(0.0)
         meta["index"] = idx
         return meta
 

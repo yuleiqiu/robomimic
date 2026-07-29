@@ -74,6 +74,7 @@ def train(config, device, resume=False):
     # extract the metadata and shape metadata across all datasets
     env_meta_list = []
     shape_meta_list = []
+    metadata_dataset_cfgs = []
     if isinstance(config.train.data, str):
         # if only a single dataset is provided, convert to list
         with config.values_unlocked():
@@ -82,6 +83,16 @@ def train(config, device, resume=False):
         dataset_path = os.path.expanduser(dataset_cfg["path"])
         if not os.path.exists(dataset_path):
             raise Exception("Dataset at provided path {} not found!".format(dataset_path))
+        if dataset_cfg.get("type", "sequence") == "paired_correction":
+            print(
+                "\n============= Loaded Paired-Correction Data ============="
+            )
+            print(dataset_path)
+            print(
+                "Environment and shape metadata are inherited from the "
+                "sequence dataset."
+            )
+            continue
 
         # load basic metadata from training file
         print("\n============= Loaded Environment Metadata =============")
@@ -102,6 +113,13 @@ def train(config, device, resume=False):
             verbose=True
         )
         shape_meta_list.append(shape_meta)
+        metadata_dataset_cfgs.append(dataset_cfg)
+
+    if not metadata_dataset_cfgs:
+        raise ValueError(
+            "At least one sequence dataset is required for environment and "
+            "shape metadata"
+        )
 
     if config.experiment.env is not None:
         # if an environment name is specified, just use this env using the first dataset's metadata
@@ -117,7 +135,7 @@ def train(config, device, resume=False):
         # create environments for validation runs
         for env_i in range(len(env_meta_list)):
             # check if this env should be evaluated
-            dataset_cfg = config.train.data[env_i]
+            dataset_cfg = metadata_dataset_cfgs[env_i]
             do_eval = dataset_cfg.get("eval", True)
             if not do_eval:
                 continue
@@ -170,7 +188,26 @@ def train(config, device, resume=False):
     if config.train.hdf5_normalize_obs:
         obs_normalization_stats = trainset.get_obs_normalization_stats()
 
-    # maybe retreve statistics for normalizing actions
+    # maybe retrieve or install statistics for normalizing actions
+    action_normalization_reference = config.train.get(
+        "action_normalization_reference", None
+    )
+    if action_normalization_reference is not None:
+        reference_checkpoint = FileUtils.load_dict_from_checkpoint(
+            ckpt_path=os.path.expanduser(action_normalization_reference)
+        )
+        normalization_check = TrainUtils.set_reference_action_normalization(
+            train_dataset=trainset,
+            valid_dataset=validset,
+            reference_stats=reference_checkpoint[
+                "action_normalization_stats"
+            ],
+        )
+        print(
+            "Using reference checkpoint action normalization: {}".format(
+                normalization_check
+            )
+        )
     action_normalization_stats = trainset.get_action_normalization_stats()
 
     # initialize data loaders

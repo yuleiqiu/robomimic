@@ -3,12 +3,10 @@
 > Forked robomimic used by the parent project for clean-image Diffusion Policy
 > training and rollout on executable EEF-pose OSC action targets.
 
-> **Status (2026-07-28)**: the LAN-O3DP point-cloud training and guided
-> deployment branch is complete and closed after missing its clean-source and
-> paired task gates. The current parent-project branch uses this fork to build
-> a targeted fine-tuning upper bound from the reliable clean-image
-> `delta_eef_pose_action` epoch-260 checkpoint. Preserve the completed LAN and
-> guided code as reproducible baselines.
+> **Status (2026-07-29)**: targeted positive BC, a lower-exposure control, and
+> paper-aligned SDP set supervision have completed. All add local corrective
+> support but miss the paired D2 task gate. Preserve these training paths and
+> the earlier LAN / guided code as reproducible baselines.
 
 ## 1. Architecture Overview
 
@@ -38,6 +36,7 @@ algo class.
 | `Algo` | `algo/algo.py` | Root base: owns `self.nets`, creates optimizer, handles checkpoint serialize / deserialize |
 | `PolicyAlgo` | `algo/algo.py` | Adds abstract `get_action()` |
 | `DiffusionPolicyUNet` | `algo/diffusion_policy.py` | Core DDPM / DDIM diffusion policy |
+| `PairedCorrectionDataset` | `utils/dataset.py` | Fixed-window positive / negative correction pairs |
 | `GuidedDiffusionPolicyUNet` | `algo/guided_diffusion_policy.py` | Registered opt-in DDIM guided variant |
 | `LanO3DPUNet` | `algo/lan_o3dp.py` | LAN-aligned point-cloud diffusion policy |
 | `GuidedLanO3DPUNet` | `algo/lan_o3dp.py` | Opt-in guided LAN variant for DDPM checkpoints |
@@ -118,6 +117,13 @@ not the starting point for targeted fine-tuning.
 - `train.data` accepts multiple HDF5 dataset entries. `MetaDataset` provides
   weighted sampling; with `normalize_weights_by_ds_size=true`, dataset-level
   weights control expected source proportions instead of raw sequence counts.
+- Paired-correction entries can opt into normalized `negative_actions` and an
+  `is_paired_correction` label. Clean components receive identity negatives so
+  standard collation remains valid.
+- `algo.sdp` is opt-in and backward-compatible with old locked checkpoint
+  configs. It generates detached constrained DDPM targets from the online
+  UNet and averages `N` target losses within each original sample before the
+  mixed batch mean.
 - `experiment.ckpt_path` initializes model and EMA weights for a new training
   run with a fresh optimizer. `--resume` instead restores optimizer,
   scheduler, epoch, and variable state from the latest checkpoint.

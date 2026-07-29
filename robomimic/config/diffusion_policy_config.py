@@ -62,6 +62,15 @@ class DiffusionPolicyConfig(BaseConfig):
         # EMA parameters
         self.algo.ema.enabled = True
         self.algo.ema.power = 0.75
+
+        # Optional Set-Supervised Diffusion Policy targets for paired
+        # corrective supervision. Clean samples retain the standard BC loss.
+        self.algo.sdp.enabled = False
+        self.algo.sdp.radius_ratio = 0.1
+        self.algo.sdp.num_samples = 16
+        self.algo.sdp.start_timestep = 16
+        self.algo.sdp.initialization = "gaussian"
+        self.algo.sdp.constraint_tolerance = 1e-6
         
         # Noise Scheduler
         ## DDPM

@@ -186,6 +186,13 @@ class BaseConfig(Config):
         # in utils/dataset.py for more information.
         self.train.hdf5_normalize_obs = False
 
+        # Optional checkpoint whose saved action-normalization statistics
+        # define the fixed coordinate system for fine-tuning. Sequence-source
+        # statistics must match it, and every additional dataset must remain
+        # in its normalized range. Both train and validation datasets then use
+        # the checkpoint statistics instead of refitting mixed statistics.
+        self.train.action_normalization_reference = None
+
         # if provided, use the list of demo keys under the hdf5 group "mask/@hdf5_filter_key" for training, instead 
         # of the full dataset. This provides a convenient way to train on only a subset of the trajectories in a dataset.
         self.train.hdf5_filter_key = None

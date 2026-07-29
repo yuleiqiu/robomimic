@@ -3,6 +3,7 @@ Implementation of Diffusion Policy https://diffusion-policy.cs.columbia.edu/ by 
 """
 from typing import Callable, Union
 import math
+import time
 from collections import OrderedDict, deque
 from packaging.version import parse as parse_version
 import random
@@ -21,11 +22,7 @@ import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.obs_utils as ObsUtils
 
 from robomimic.algo import register_algo_factory_func, PolicyAlgo
-
-import random
-import robomimic.utils.torch_utils as TorchUtils
-import robomimic.utils.tensor_utils as TensorUtils
-import robomimic.utils.obs_utils as ObsUtils
+from robomimic.algo.sdp_utils import sample_desired_action_chunks
 
 
 @register_algo_factory_func("diffusion_policy")
@@ -126,6 +123,28 @@ class DiffusionPolicyUNet(PolicyAlgo):
         # set attrs
         self.nets = nets
         self.noise_scheduler = noise_scheduler
+        self.sdp_config = self.algo_config.get("sdp", None)
+        self.sdp_enabled = bool(
+            self.sdp_config is not None
+            and self.sdp_config.get("enabled", False)
+        )
+        self.sdp_target_scheduler = None
+        if self.sdp_enabled:
+            if self.sdp_config.start_timestep >= (
+                noise_scheduler.config.num_train_timesteps
+            ):
+                raise ValueError(
+                    "SDP start_timestep must be smaller than the training "
+                    "diffusion horizon"
+                )
+            self.sdp_target_scheduler = DDPMScheduler(
+                num_train_timesteps=(
+                    noise_scheduler.config.num_train_timesteps
+                ),
+                beta_schedule=noise_scheduler.config.beta_schedule,
+                clip_sample=noise_scheduler.config.clip_sample,
+                prediction_type=noise_scheduler.config.prediction_type,
+            )
         self.ema = ema
         self.action_check_done = False
         self.obs_queue = None
@@ -152,17 +171,194 @@ class DiffusionPolicyUNet(PolicyAlgo):
         input_batch["obs"] = {k: batch["obs"][k][:, :To, :] for k in batch["obs"]}
         input_batch["goal_obs"] = batch.get("goal_obs", None) # goals may not be present
         input_batch["actions"] = batch["actions"][:, :Tp, :]
+        if "negative_actions" in batch:
+            input_batch["negative_actions"] = batch[
+                "negative_actions"
+            ][:, :Tp, :]
+        if "is_paired_correction" in batch:
+            input_batch["is_paired_correction"] = batch[
+                "is_paired_correction"
+            ]
         
         # check if actions are normalized to [-1,1]
         if not self.action_check_done:
-            actions = input_batch["actions"]
-            in_range = (-1 <= actions) & (actions <= 1)
-            all_in_range = torch.all(in_range).item()
-            if not all_in_range:
-                raise ValueError("'actions' must be in range [-1,1] for Diffusion Policy! Check if hdf5_normalize_action is enabled.")
+            action_tensors = [input_batch["actions"]]
+            if self.sdp_enabled:
+                if "negative_actions" not in input_batch:
+                    raise ValueError(
+                        "SDP is enabled but negative_actions are absent"
+                    )
+                action_tensors.append(input_batch["negative_actions"])
+            for action_tensor in action_tensors:
+                in_range = (-1 <= action_tensor) & (action_tensor <= 1)
+                all_in_range = torch.all(in_range).item()
+                if not all_in_range:
+                    raise ValueError("'actions' must be in range [-1,1] for Diffusion Policy! Check if hdf5_normalize_action is enabled.")
             self.action_check_done = True
         
         return TensorUtils.to_device(TensorUtils.to_float(input_batch), self.device)
+
+    def _prepare_sdp_training_targets(self, batch, obs_cond):
+        """Replace correction labels with policy-relative desired-set samples."""
+
+        if "negative_actions" not in batch:
+            raise ValueError(
+                "SDP training requires paired negative actions in the batch"
+            )
+        if "is_paired_correction" not in batch:
+            raise ValueError(
+                "SDP training requires is_paired_correction labels"
+            )
+
+        actions = batch["actions"]
+        correction_mask = batch["is_paired_correction"].reshape(-1) > 0.5
+        correction_indices = torch.nonzero(
+            correction_mask, as_tuple=False
+        ).flatten()
+        clean_indices = torch.nonzero(
+            ~correction_mask, as_tuple=False
+        ).flatten()
+        original_batch_size = actions.shape[0]
+
+        if correction_indices.numel() == 0:
+            return (
+                actions,
+                obs_cond,
+                torch.arange(
+                    original_batch_size, device=self.device, dtype=torch.long
+                ),
+                {
+                    "correction_pair_count": torch.zeros(
+                        (), device=self.device
+                    ),
+                    "desired_target_count": torch.zeros(
+                        (), device=self.device
+                    ),
+                    "replacement_rate": torch.zeros(
+                        (), device=self.device
+                    ),
+                    "final_preprojection_retention_rate": torch.zeros(
+                        (), device=self.device
+                    ),
+                    "mean_set_radius": torch.zeros(
+                        (), device=self.device
+                    ),
+                    "maximum_set_radius": torch.zeros(
+                        (), device=self.device
+                    ),
+                    "mean_target_distance": torch.zeros(
+                        (), device=self.device
+                    ),
+                    "maximum_target_distance": torch.zeros(
+                        (), device=self.device
+                    ),
+                    "nonpositive_timestep_rate": torch.zeros(
+                        (), device=self.device
+                    ),
+                    "target_generation_seconds": torch.zeros(
+                        (), device=self.device
+                    ),
+                },
+            )
+
+        start_time = time.perf_counter()
+        desired_targets, sampler_statistics = sample_desired_action_chunks(
+            noise_pred_net=self.nets["policy"]["noise_pred_net"],
+            scheduler=self.sdp_target_scheduler,
+            observation_condition=obs_cond[correction_indices].detach(),
+            positive_actions=actions[correction_indices].detach(),
+            negative_actions=batch["negative_actions"][
+                correction_indices
+            ].detach(),
+            radius_ratio=self.sdp_config.radius_ratio,
+            num_samples=self.sdp_config.num_samples,
+            start_timestep=self.sdp_config.start_timestep,
+            initialization=self.sdp_config.initialization,
+            tolerance=self.sdp_config.constraint_tolerance,
+        )
+        target_generation_seconds = time.perf_counter() - start_time
+        num_desired_samples = desired_targets.shape[1]
+
+        training_actions = torch.cat(
+            [
+                actions[clean_indices],
+                desired_targets.flatten(0, 1),
+            ],
+            dim=0,
+        )
+        training_condition = torch.cat(
+            [
+                obs_cond[clean_indices],
+                obs_cond[correction_indices].repeat_interleave(
+                    num_desired_samples, dim=0
+                ),
+            ],
+            dim=0,
+        )
+        original_sample_indices = torch.cat(
+            [
+                clean_indices,
+                correction_indices.repeat_interleave(
+                    num_desired_samples
+                ),
+            ],
+            dim=0,
+        )
+        statistics = {
+            **sampler_statistics,
+            "correction_pair_count": correction_indices.numel()
+            * torch.ones((), device=self.device),
+            "desired_target_count": desired_targets.shape[0]
+            * desired_targets.shape[1]
+            * torch.ones((), device=self.device),
+            "target_generation_seconds": torch.tensor(
+                target_generation_seconds,
+                device=self.device,
+            ),
+        }
+        return (
+            training_actions,
+            training_condition,
+            original_sample_indices,
+            statistics,
+        )
+
+    @staticmethod
+    def _grouped_diffusion_loss(
+        noise_prediction,
+        noise,
+        original_sample_indices,
+        original_batch_size,
+    ):
+        """
+        Average desired targets within each original sample before the batch.
+
+        This prevents ``N`` SDP targets from multiplying the correction
+        exposure relative to one clean BC target.
+        """
+
+        per_target_loss = F.mse_loss(
+            noise_prediction,
+            noise,
+            reduction="none",
+        ).flatten(start_dim=1).mean(dim=1)
+        per_sample_loss = torch.zeros(
+            original_batch_size,
+            device=per_target_loss.device,
+            dtype=per_target_loss.dtype,
+        )
+        per_sample_count = torch.zeros_like(per_sample_loss)
+        per_sample_loss.scatter_add_(
+            0, original_sample_indices, per_target_loss
+        )
+        per_sample_count.scatter_add_(
+            0,
+            original_sample_indices,
+            torch.ones_like(per_target_loss),
+        )
+        if torch.any(per_sample_count == 0):
+            raise RuntimeError("An original training sample has no target")
+        return torch.mean(per_sample_loss / per_sample_count)
         
     def train_on_batch(self, batch, epoch, validate=False):
         """
@@ -205,6 +401,22 @@ class DiffusionPolicyUNet(PolicyAlgo):
             assert obs_features.ndim == 3  # [B, T, D]
 
             obs_cond = obs_features.flatten(start_dim=1)
+
+            original_batch_size = actions.shape[0]
+            original_sample_indices = torch.arange(
+                original_batch_size,
+                device=self.device,
+                dtype=torch.long,
+            )
+            sdp_statistics = None
+            if self.sdp_enabled:
+                (
+                    actions,
+                    obs_cond,
+                    original_sample_indices,
+                    sdp_statistics,
+                ) = self._prepare_sdp_training_targets(batch, obs_cond)
+            B = actions.shape[0]
             
             # sample noise to add to actions
             noise = torch.randn(actions.shape, device=self.device)
@@ -225,13 +437,23 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 noisy_actions, timesteps, global_cond=obs_cond)
             
             # L2 loss
-            loss = F.mse_loss(noise_pred, noise)
+            if self.sdp_enabled:
+                loss = self._grouped_diffusion_loss(
+                    noise_prediction=noise_pred,
+                    noise=noise,
+                    original_sample_indices=original_sample_indices,
+                    original_batch_size=original_batch_size,
+                )
+            else:
+                loss = F.mse_loss(noise_pred, noise)
             
             # logging
             losses = {
                 "l2_loss": loss
             }
             info["losses"] = TensorUtils.detach(losses)
+            if sdp_statistics is not None:
+                info["sdp"] = TensorUtils.detach(sdp_statistics)
 
             if not validate:
                 # gradient step
@@ -265,6 +487,9 @@ class DiffusionPolicyUNet(PolicyAlgo):
         """
         log = super(DiffusionPolicyUNet, self).log_info(info)
         log["Loss"] = info["losses"]["l2_loss"].item()
+        if "sdp" in info:
+            for key, value in info["sdp"].items():
+                log["SDP/{}".format(key)] = value.item()
         if "policy_grad_norms" in info:
             log["Policy_Grad_Norms"] = info["policy_grad_norms"]
         return log

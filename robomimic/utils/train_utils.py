@@ -22,7 +22,12 @@ import robomimic.utils.log_utils as LogUtils
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.lang_utils as LangUtils
 
-from robomimic.utils.dataset import SequenceDataset, MetaDataset
+from robomimic.utils.dataset import (
+    SequenceDataset,
+    PairedCorrectionDataset,
+    MetaDataset,
+    action_stats_to_normalization_stats,
+)
 from robomimic.envs.env_base import EnvBase
 from robomimic.envs.wrappers import EnvWrapper
 from robomimic.algo import RolloutPolicy
@@ -119,14 +124,24 @@ def load_data_for_training(config, obs_keys):
             " - please fill config.train.hdf5_filter_key and config.train.hdf5_validation_filter_key"
         assert isinstance(config.train.data, list), "config.train.data should be a list of datasets, not a single dataset"
         for dataset_cfg in config.train.data:
-            train_demo_keys = FileUtils.get_demos_for_filter_key(
-                hdf5_path=os.path.expanduser(dataset_cfg["path"]),
-                filter_key=train_filter_by_attribute,
-            )
-            valid_demo_keys = FileUtils.get_demos_for_filter_key(
-                hdf5_path=os.path.expanduser(dataset_cfg["path"]),
-                filter_key=valid_filter_by_attribute,
-            )
+            dataset_path = os.path.expanduser(dataset_cfg["path"])
+            if dataset_cfg.get("type", "sequence") == "paired_correction":
+                with h5py.File(dataset_path, "r") as pair_file:
+                    train_demo_keys = _paired_correction_split_ids(
+                        pair_file, train_filter_by_attribute
+                    )
+                    valid_demo_keys = _paired_correction_split_ids(
+                        pair_file, valid_filter_by_attribute
+                    )
+            else:
+                train_demo_keys = FileUtils.get_demos_for_filter_key(
+                    hdf5_path=dataset_path,
+                    filter_key=train_filter_by_attribute,
+                )
+                valid_demo_keys = FileUtils.get_demos_for_filter_key(
+                    hdf5_path=dataset_path,
+                    filter_key=valid_filter_by_attribute,
+                )
             assert set(train_demo_keys).isdisjoint(set(valid_demo_keys)), "training demonstrations overlap with " \
                 "validation demonstrations!"
         train_dataset = dataset_factory(config, obs_keys, filter_by_attribute=train_filter_by_attribute)
@@ -195,17 +210,212 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
 
     meta_ds_kwargs = dict()
 
-    dataset = get_dataset(
-        ds_class=SequenceDataset,
-        ds_kwargs=ds_kwargs,
-        ds_weights=ds_weights,
-        ds_langs=ds_langs,
-        normalize_weights_by_ds_size=config.train.normalize_weights_by_ds_size,
-        meta_ds_class=MetaDataset,
-        meta_ds_kwargs=meta_ds_kwargs,
-    )
+    ds_list = []
+    for index, dataset_cfg in enumerate(config.train.data):
+        ds_kwargs_copy = deepcopy(ds_kwargs)
+        for key in ("hdf5_path", "filter_by_attribute", "demo_limit"):
+            ds_kwargs_copy[key] = ds_kwargs[key][index]
+        ds_kwargs_copy["lang"] = ds_langs[index]
+
+        dataset_type = dataset_cfg.get("type", "sequence")
+        if dataset_type == "sequence":
+            dataset = SequenceDataset(**ds_kwargs_copy)
+        elif dataset_type == "paired_correction":
+            if config.train.hdf5_normalize_obs:
+                raise ValueError(
+                    "Paired-correction mixing does not support observation "
+                    "normalization"
+                )
+            ds_kwargs_copy["positive_action_key"] = dataset_cfg.get(
+                "positive_action_key", "positive_actions"
+            )
+            ds_kwargs_copy["negative_action_key"] = dataset_cfg.get(
+                "negative_action_key", "negative_actions"
+            )
+            ds_kwargs_copy["return_negative_actions"] = dataset_cfg.get(
+                "return_negative_actions", False
+            )
+            ds_kwargs_copy["cache_in_memory"] = dataset_cfg.get(
+                "cache_in_memory", False
+            )
+            dataset = PairedCorrectionDataset(**ds_kwargs_copy)
+        else:
+            raise ValueError(
+                "Unknown dataset type {!r}".format(dataset_type)
+            )
+        ds_list.append(dataset)
+
+    if len(ds_list) == 1:
+        dataset = ds_list[0]
+    else:
+        dataset = MetaDataset(
+            datasets=ds_list,
+            ds_weights=ds_weights,
+            normalize_weights_by_ds_size=(
+                config.train.normalize_weights_by_ds_size
+            ),
+            **meta_ds_kwargs
+        )
 
     return dataset
+
+
+def _paired_correction_split_ids(pair_file, filter_key):
+    direct_key = "mask/{}".format(filter_key)
+    episode_key = "mask/{}_episode_ids".format(filter_key)
+    if direct_key in pair_file:
+        values = pair_file[direct_key][()]
+    elif episode_key in pair_file:
+        values = pair_file[episode_key][()]
+    else:
+        raise KeyError(
+            "Pair file has no split mask for {!r}".format(filter_key)
+        )
+    return [
+        value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        for value in values
+    ]
+
+
+def assert_action_normalization_stats_match(
+    actual_stats,
+    reference_stats,
+    atol=1e-8,
+):
+    """Require identical action coordinates before checkpoint fine-tuning."""
+
+    if set(actual_stats) != set(reference_stats):
+        raise ValueError(
+            "Action-normalization keys differ: actual={} reference={}".format(
+                sorted(actual_stats), sorted(reference_stats)
+            )
+        )
+    maximum_difference = 0.0
+    for action_key in actual_stats:
+        if set(actual_stats[action_key]) != set(reference_stats[action_key]):
+            raise ValueError(
+                "Action-normalization fields differ for {}".format(action_key)
+            )
+        for stat_name in actual_stats[action_key]:
+            actual = np.asarray(actual_stats[action_key][stat_name])
+            reference = np.asarray(reference_stats[action_key][stat_name])
+            if actual.shape != reference.shape:
+                raise ValueError(
+                    "Action-normalization shape differs for {}.{}: {} vs "
+                    "{}".format(
+                        action_key,
+                        stat_name,
+                        actual.shape,
+                        reference.shape,
+                    )
+                )
+            difference = float(np.max(np.abs(actual - reference)))
+            maximum_difference = max(maximum_difference, difference)
+            if not np.allclose(actual, reference, rtol=0.0, atol=atol):
+                raise ValueError(
+                    "Action-normalization mismatch for {}.{} "
+                    "(maximum absolute difference {})".format(
+                        action_key, stat_name, difference
+                    )
+                )
+    return maximum_difference
+
+
+def set_reference_action_normalization(
+    train_dataset,
+    valid_dataset,
+    reference_stats,
+    range_tolerance=1e-6,
+):
+    """
+    Validate and install a pretrained action coordinate system.
+
+    Standard sequence components must reproduce the reference statistics.
+    Paired-correction components may contain tiny raw endpoint differences
+    caused by unnormalizing a policy prediction at exactly -1 or +1, but every
+    action must remain inside the reference normalized range.
+    """
+
+    array_reference_stats = OrderedDict(
+        (
+            action_key,
+            {
+                stat_name: np.asarray(value, dtype=np.float32)
+                for stat_name, value in action_stats.items()
+            },
+        )
+        for action_key, action_stats in reference_stats.items()
+    )
+    components = (
+        train_dataset.datasets
+        if isinstance(train_dataset, MetaDataset)
+        else [train_dataset]
+    )
+    sequence_maximum_difference = 0.0
+    correction_maximum_absolute_normalized = 0.0
+    for component in components:
+        action_stats = component.get_action_stats()
+        if isinstance(component, SequenceDataset):
+            component_stats = action_stats_to_normalization_stats(
+                action_stats, component.action_config
+            )
+            difference = assert_action_normalization_stats_match(
+                component_stats, array_reference_stats
+            )
+            sequence_maximum_difference = max(
+                sequence_maximum_difference, difference
+            )
+        elif isinstance(component, PairedCorrectionDataset):
+            paired_stats = [("positive", action_stats)]
+            if component.return_negative_actions:
+                paired_stats.append(
+                    ("negative", component.get_negative_action_stats())
+                )
+            for pair_role, role_stats in paired_stats:
+                for action_key, stats in role_stats.items():
+                    offset = array_reference_stats[action_key]["offset"]
+                    scale = array_reference_stats[action_key]["scale"]
+                    normalized_min = (stats["min"] - offset) / scale
+                    normalized_max = (stats["max"] - offset) / scale
+                    maximum = float(
+                        max(
+                            np.max(np.abs(normalized_min)),
+                            np.max(np.abs(normalized_max)),
+                        )
+                    )
+                    correction_maximum_absolute_normalized = max(
+                        correction_maximum_absolute_normalized, maximum
+                    )
+                    if maximum > 1.0 + range_tolerance:
+                        raise ValueError(
+                            "Paired correction {} {} exceeds reference "
+                            "normalized range: maximum absolute value "
+                            "{}".format(
+                                pair_role,
+                                action_key,
+                                maximum,
+                            )
+                        )
+        else:
+            raise TypeError(
+                "Unsupported dataset component {}".format(
+                    type(component).__name__
+                )
+            )
+
+    train_dataset.set_action_normalization_stats(
+        deepcopy(array_reference_stats)
+    )
+    if valid_dataset is not None:
+        valid_dataset.set_action_normalization_stats(
+            deepcopy(array_reference_stats)
+        )
+    return {
+        "sequence_maximum_difference": sequence_maximum_difference,
+        "correction_maximum_absolute_normalized": (
+            correction_maximum_absolute_normalized
+        ),
+    }
 
 
 def get_dataset(
