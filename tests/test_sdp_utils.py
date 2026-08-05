@@ -2,6 +2,7 @@ import unittest
 
 import torch
 import torch.nn.functional as F
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from robomimic.algo.diffusion_policy import DiffusionPolicyUNet
@@ -165,8 +166,8 @@ class TestSDPUtils(unittest.TestCase):
         target = torch.randn_like(prediction)
         sample_indices = torch.arange(5)
         grouped_loss = DiffusionPolicyUNet._grouped_diffusion_loss(
-            noise_prediction=prediction,
-            noise=target,
+            prediction=prediction,
+            target=target,
             original_sample_indices=sample_indices,
             original_batch_size=5,
         )
@@ -174,6 +175,50 @@ class TestSDPUtils(unittest.TestCase):
             grouped_loss,
             F.mse_loss(prediction, target),
         )
+
+    def test_training_target_follows_scheduler_prediction_type(self):
+        actions = torch.randn(3, 4, 2)
+        noise = torch.randn_like(actions)
+        timesteps = torch.tensor([0, 4, 9])
+
+        for scheduler_class in (DDPMScheduler, DDIMScheduler):
+            for prediction_type, expected in (
+                ("epsilon", noise),
+                ("sample", actions),
+            ):
+                with self.subTest(
+                    scheduler=scheduler_class.__name__,
+                    prediction_type=prediction_type,
+                ):
+                    scheduler = scheduler_class(
+                        num_train_timesteps=10,
+                        prediction_type=prediction_type,
+                    )
+                    actual = DiffusionPolicyUNet._diffusion_training_target(
+                        actions=actions,
+                        noise=noise,
+                        timesteps=timesteps,
+                        noise_scheduler=scheduler,
+                    )
+                    torch.testing.assert_close(actual, expected)
+
+    def test_velocity_training_target_uses_scheduler_definition(self):
+        actions = torch.randn(3, 4, 2)
+        noise = torch.randn_like(actions)
+        timesteps = torch.tensor([0, 4, 9])
+        scheduler = DDPMScheduler(
+            num_train_timesteps=10,
+            prediction_type="v_prediction",
+        )
+
+        actual = DiffusionPolicyUNet._diffusion_training_target(
+            actions=actions,
+            noise=noise,
+            timesteps=timesteps,
+            noise_scheduler=scheduler,
+        )
+        expected = scheduler.get_velocity(actions, noise, timesteps)
+        torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":

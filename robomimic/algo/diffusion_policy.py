@@ -324,9 +324,29 @@ class DiffusionPolicyUNet(PolicyAlgo):
         )
 
     @staticmethod
-    def _grouped_diffusion_loss(
-        noise_prediction,
+    def _diffusion_training_target(
+        actions,
         noise,
+        timesteps,
+        noise_scheduler,
+    ):
+        """Return the target implied by the scheduler prediction type."""
+
+        prediction_type = noise_scheduler.config.prediction_type
+        if prediction_type == "epsilon":
+            return noise
+        if prediction_type == "sample":
+            return actions
+        if prediction_type == "v_prediction":
+            return noise_scheduler.get_velocity(actions, noise, timesteps)
+        raise ValueError(
+            f"Unsupported diffusion prediction type: {prediction_type}"
+        )
+
+    @staticmethod
+    def _grouped_diffusion_loss(
+        prediction,
+        target,
         original_sample_indices,
         original_batch_size,
     ):
@@ -338,8 +358,8 @@ class DiffusionPolicyUNet(PolicyAlgo):
         """
 
         per_target_loss = F.mse_loss(
-            noise_prediction,
-            noise,
+            prediction,
+            target,
             reduction="none",
         ).flatten(start_dim=1).mean(dim=1)
         per_sample_loss = torch.zeros(
@@ -432,20 +452,26 @@ class DiffusionPolicyUNet(PolicyAlgo):
             noisy_actions = self.noise_scheduler.add_noise(
                 actions, noise, timesteps)
             
-            # predict the noise residual
-            noise_pred = self.nets["policy"]["noise_pred_net"](
+            # predict the scheduler-specific diffusion target
+            prediction = self.nets["policy"]["noise_pred_net"](
                 noisy_actions, timesteps, global_cond=obs_cond)
+            target = self._diffusion_training_target(
+                actions=actions,
+                noise=noise,
+                timesteps=timesteps,
+                noise_scheduler=self.noise_scheduler,
+            )
             
             # L2 loss
             if self.sdp_enabled:
                 loss = self._grouped_diffusion_loss(
-                    noise_prediction=noise_pred,
-                    noise=noise,
+                    prediction=prediction,
+                    target=target,
                     original_sample_indices=original_sample_indices,
                     original_batch_size=original_batch_size,
                 )
             else:
-                loss = F.mse_loss(noise_pred, noise)
+                loss = F.mse_loss(prediction, target)
             
             # logging
             losses = {
