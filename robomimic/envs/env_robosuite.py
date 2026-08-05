@@ -44,6 +44,54 @@ except ImportError:
     MUJOCO_EXCEPTIONS = []
 
 
+def normalize_eef_pose_observation_config(config):
+    """Validate the optional LAN-style 6-D EEF pose observation."""
+
+    if config is None or config is False:
+        return {"enabled": False, "obs_key": "agent_pos", "robot_prefix": "robot0"}
+    if config is True:
+        config = {}
+    if not isinstance(config, dict):
+        raise TypeError("eef_pose_observation must be a bool or dict")
+    normalized = {
+        "enabled": True,
+        "obs_key": "agent_pos",
+        "robot_prefix": "robot0",
+    }
+    normalized.update(config)
+    normalized["enabled"] = bool(normalized["enabled"])
+    for key in ("obs_key", "robot_prefix"):
+        if not isinstance(normalized[key], str) or not normalized[key]:
+            raise ValueError("{} must be a non-empty string".format(key))
+    return normalized
+
+
+def eef_pose_observation_from_raw(obs, config):
+    """Build ``[world xyz, site-quaternion axis-angle]`` from robosuite obs."""
+
+    prefix = config["robot_prefix"]
+    position_key = "{}_eef_pos".format(prefix)
+    quaternion_key = "{}_eef_quat_site".format(prefix)
+    missing = [key for key in (position_key, quaternion_key) if key not in obs]
+    if missing:
+        raise KeyError(
+            "EEF pose observation is missing raw keys: {}".format(
+                ", ".join(missing)
+            )
+        )
+    position = np.asarray(obs[position_key], dtype=np.float32).reshape(-1)
+    quaternion = np.asarray(obs[quaternion_key], dtype=np.float64).reshape(-1)
+    if position.shape != (3,) or quaternion.shape != (4,):
+        raise ValueError(
+            "Expected EEF position/quaternion shapes (3,) and (4,), got {} and {}".format(
+                position.shape,
+                quaternion.shape,
+            )
+        )
+    axis_angle = T.quat2axisangle(quaternion.copy()).astype(np.float32)
+    return np.concatenate((position, axis_angle), axis=0)
+
+
 class EnvRobosuite(EB.EnvBase):
     """Wrapper class for robosuite environments (https://github.com/ARISE-Initiative/robosuite)"""
     def __init__(
@@ -84,6 +132,9 @@ class EnvRobosuite(EB.EnvBase):
             assert (int(robosuite.__version__.split(".")[1]) >= 2), "only support robosuite v0.3 and v1.2+"
 
         kwargs = deepcopy(kwargs)
+        self.eef_pose_observation_config = normalize_eef_pose_observation_config(
+            kwargs.pop("eef_pose_observation", None)
+        )
         self.target_mask_image_config = kwargs.pop("target_mask_image", None)
         self.target_pointcloud_config = TargetPointCloudUtils.normalize_target_pointcloud_config(
             kwargs.pop("target_pointcloud", {"enabled": False})
@@ -126,6 +177,10 @@ class EnvRobosuite(EB.EnvBase):
         self._init_kwargs = deepcopy(kwargs)
         if self.target_pointcloud_config["enabled"]:
             self._init_kwargs["target_pointcloud"] = deepcopy(self.target_pointcloud_config)
+        if self.eef_pose_observation_config["enabled"]:
+            self._init_kwargs["eef_pose_observation"] = deepcopy(
+                self.eef_pose_observation_config
+            )
         self.env = robosuite.make(self._env_name, **kwargs)
         self.lang = lang
         self._lang_emb = LangUtils.get_lang_emb(self.lang)
@@ -323,6 +378,13 @@ class EnvRobosuite(EB.EnvBase):
 
         if self._lang_emb is not None:
             ret[LangUtils.LANG_EMB_OBS_KEY] = np.array(self._lang_emb)
+        if self.eef_pose_observation_config["enabled"]:
+            ret[self.eef_pose_observation_config["obs_key"]] = (
+                eef_pose_observation_from_raw(
+                    ret,
+                    self.eef_pose_observation_config,
+                )
+            )
         ret = TargetMaskUtils.apply_target_mask_images_to_obs(
             raw_env=self.env,
             obs=ret,

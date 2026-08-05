@@ -12,3 +12,4 @@ from robomimic.algo.td3_bc import TD3_BC
 from robomimic.algo.diffusion_policy import DiffusionPolicyUNet
 from robomimic.algo.guided_diffusion_policy import GuidedDiffusionPolicyUNet, GuidedLanO3DPUNet
 from robomimic.algo.lan_o3dp import LanO3DPUNet
+from robomimic.algo.paper_guided_lan_o3dp import PaperGuidedLanO3DPUNet

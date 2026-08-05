@@ -14,3 +14,4 @@ from robomimic.config.diffusion_policy_config import DiffusionPolicyConfig
 from robomimic.config.guided_diffusion_policy_config import GuidedDiffusionPolicyConfig
 from robomimic.config.lan_o3dp_config import LanO3DPConfig
 from robomimic.config.guided_lan_o3dp_config import GuidedLanO3DPConfig
+from robomimic.config.paper_guided_lan_o3dp_config import PaperGuidedLanO3DPConfig

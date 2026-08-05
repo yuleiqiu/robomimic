@@ -23,6 +23,7 @@ DEFAULT_POINTCLOUD_CONFIG = {
     "target_object": "Can",
     "include_visual_goal": True,
     "num_points": 512,
+    "padding_mode": "repeat",
     # Reject transparent-goal segmentation pixels whose depth belongs to an
     # occluding/background geom. This is comfortably larger than a Can.
     "max_geom_distance": 0.15,
@@ -54,6 +55,8 @@ def normalize_target_pointcloud_config(config):
         if not isinstance(normalized[key], str) or not normalized[key]:
             raise ValueError("{} must be a non-empty string".format(key))
     normalized["include_visual_goal"] = bool(normalized["include_visual_goal"])
+    if normalized["padding_mode"] not in ("repeat", "zero"):
+        raise ValueError("padding_mode must be 'repeat' or 'zero'")
     max_geom_distance = normalized.get("max_geom_distance")
     if max_geom_distance is not None:
         max_geom_distance = float(max_geom_distance)
@@ -113,9 +116,14 @@ def unproject_depth_pixels_to_world(depth_m, pixels_rc, intrinsic, camera_pose):
     return world_points[:, :3].astype(np.float32)
 
 
-def deterministic_farthest_point_sample(points, num_points):
+def deterministic_farthest_point_sample(
+    points,
+    num_points,
+    padding_mode="repeat",
+):
     """
-    Deterministically FPS to ``num_points`` and cyclically repeat if undersized.
+    Deterministically FPS to ``num_points`` and apply the requested fallback
+    padding if the visible cloud is undersized.
 
     The first point is the input point farthest from the centroid. Stable
     ``argmax`` tie-breaking and row-major pixel enumeration make extraction
@@ -130,9 +138,18 @@ def deterministic_farthest_point_sample(points, num_points):
     if len(points) == 0:
         raise ValueError("Cannot sample an empty point cloud")
 
+    if padding_mode not in ("repeat", "zero"):
+        raise ValueError("padding_mode must be 'repeat' or 'zero'")
     if len(points) < num_points:
-        repeats = (num_points + len(points) - 1) // len(points)
-        return np.tile(points, (repeats, 1))[:num_points].copy()
+        if padding_mode == "zero":
+            padding = np.zeros(
+                (num_points - len(points), 3),
+                dtype=points.dtype,
+            )
+            points = np.concatenate((points, padding), axis=0)
+        else:
+            repeats = (num_points + len(points) - 1) // len(points)
+            return np.tile(points, (repeats, 1))[:num_points].copy()
     if len(points) == num_points:
         return points.copy()
 
@@ -206,7 +223,11 @@ def render_target_pointcloud(raw_env, config=None, target_geom_ids=None, return_
             <= config["max_geom_distance"]
         )
     valid_points = valid_points[finite]
-    points = deterministic_farthest_point_sample(valid_points, config["num_points"])
+    points = deterministic_farthest_point_sample(
+        valid_points,
+        config["num_points"],
+        padding_mode=config["padding_mode"],
+    )
     if return_details:
         return TargetPointCloudRender(
             points=points,

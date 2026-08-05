@@ -41,12 +41,27 @@ class TestTargetPointCloudUtils(unittest.TestCase):
         sampled = deterministic_farthest_point_sample(points, 5)
         np.testing.assert_array_equal(sampled, points[[0, 1, 0, 1, 0]])
 
+    def test_zero_padding_matches_official_lan_preprocessing(self):
+        points = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
+        sampled = deterministic_farthest_point_sample(
+            points,
+            5,
+            padding_mode="zero",
+        )
+        self.assertEqual(sampled.shape, (5, 3))
+        self.assertEqual(np.count_nonzero(np.all(sampled == 0, axis=1)), 3)
+        for point in points:
+            self.assertTrue(np.any(np.all(sampled == point, axis=1)))
+
     def test_config_validation(self):
         config = normalize_target_pointcloud_config({"num_points": 12})
         self.assertEqual(config["num_points"], 12)
         self.assertEqual(config["obs_key"], "task_pointcloud")
+        self.assertEqual(config["padding_mode"], "repeat")
         with self.assertRaises(ValueError):
             normalize_target_pointcloud_config({"height": 0})
+        with self.assertRaises(ValueError):
+            normalize_target_pointcloud_config({"padding_mode": "invalid"})
 
 
 if __name__ == "__main__":
