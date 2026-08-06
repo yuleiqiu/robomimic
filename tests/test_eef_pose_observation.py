@@ -7,6 +7,10 @@ from robomimic.envs.env_robosuite import (
     eef_pose_observation_from_raw,
     normalize_eef_pose_observation_config,
 )
+from robomimic.utils.continuous_rotation_utils import (
+    ContinuousRotationVectorState,
+    continuous_quaternion_sequence_to_rotation_vectors,
+)
 
 
 class TestEEFPoseObservation(unittest.TestCase):
@@ -38,6 +42,45 @@ class TestEEFPoseObservation(unittest.TestCase):
                 {"robot0_eef_pos": np.zeros(3)},
                 normalize_eef_pose_observation_config(True),
             )
+
+    def test_continuous_mode_requires_a_reference(self):
+        with self.assertRaises(ValueError):
+            normalize_eef_pose_observation_config(
+                {"rotation_vector_mode": "continuous"}
+            )
+
+    def test_continuous_mode_removes_quaternion_sign_jump(self):
+        first = T.axisangle2quat(np.array([0.0, 0.0, np.pi - 0.01]))
+        second = -T.axisangle2quat(
+            np.array([0.0, 0.0, np.pi + 0.01])
+        )
+        continuous = continuous_quaternion_sequence_to_rotation_vectors(
+            np.stack((first, second)),
+            reference_quaternion=first,
+        )
+        self.assertLess(np.linalg.norm(continuous[1] - continuous[0]), 0.03)
+        self.assertGreater(continuous[1, 2], np.pi)
+
+        config = normalize_eef_pose_observation_config(
+            {
+                "rotation_vector_mode": "continuous",
+                "reference_quaternion_xyzw": first.tolist(),
+            }
+        )
+        state = ContinuousRotationVectorState(first)
+        values = []
+        for quaternion in (first, second):
+            values.append(
+                eef_pose_observation_from_raw(
+                    {
+                        "robot0_eef_pos": np.zeros(3),
+                        "robot0_eef_quat_site": quaternion,
+                    },
+                    config,
+                    rotation_vector_state=state,
+                )[3:]
+            )
+        self.assertLess(np.linalg.norm(values[1] - values[0]), 0.03)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,11 @@ import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.lang_utils as LangUtils
 import robomimic.utils.target_mask_utils as TargetMaskUtils
 import robomimic.utils.target_pointcloud_utils as TargetPointCloudUtils
+from robomimic.utils.continuous_rotation_utils import (
+    ContinuousRotationVectorState,
+    ROTATION_VECTOR_MODES,
+    normalize_quaternion_xyzw,
+)
 import robomimic.envs.env_base as EB
 
 # protect against missing mujoco-py module, since robosuite might be using mujoco-py or DM backend
@@ -48,7 +53,13 @@ def normalize_eef_pose_observation_config(config):
     """Validate the optional LAN-style 6-D EEF pose observation."""
 
     if config is None or config is False:
-        return {"enabled": False, "obs_key": "agent_pos", "robot_prefix": "robot0"}
+        return {
+            "enabled": False,
+            "obs_key": "agent_pos",
+            "robot_prefix": "robot0",
+            "rotation_vector_mode": "principal",
+            "reference_quaternion_xyzw": None,
+        }
     if config is True:
         config = {}
     if not isinstance(config, dict):
@@ -57,16 +68,34 @@ def normalize_eef_pose_observation_config(config):
         "enabled": True,
         "obs_key": "agent_pos",
         "robot_prefix": "robot0",
+        "rotation_vector_mode": "principal",
+        "reference_quaternion_xyzw": None,
     }
     normalized.update(config)
     normalized["enabled"] = bool(normalized["enabled"])
     for key in ("obs_key", "robot_prefix"):
         if not isinstance(normalized[key], str) or not normalized[key]:
             raise ValueError("{} must be a non-empty string".format(key))
+    if normalized["rotation_vector_mode"] not in ROTATION_VECTOR_MODES:
+        raise ValueError(
+            "rotation_vector_mode must be one of {}".format(
+                ROTATION_VECTOR_MODES
+            )
+        )
+    reference = normalized["reference_quaternion_xyzw"]
+    if normalized["rotation_vector_mode"] == "continuous":
+        if reference is None:
+            raise ValueError(
+                "continuous rotation vectors require "
+                "reference_quaternion_xyzw"
+            )
+        normalized["reference_quaternion_xyzw"] = (
+            normalize_quaternion_xyzw(reference).tolist()
+        )
     return normalized
 
 
-def eef_pose_observation_from_raw(obs, config):
+def eef_pose_observation_from_raw(obs, config, rotation_vector_state=None):
     """Build ``[world xyz, site-quaternion axis-angle]`` from robosuite obs."""
 
     prefix = config["robot_prefix"]
@@ -88,7 +117,14 @@ def eef_pose_observation_from_raw(obs, config):
                 quaternion.shape,
             )
         )
-    axis_angle = T.quat2axisangle(quaternion.copy()).astype(np.float32)
+    if config["rotation_vector_mode"] == "continuous":
+        if rotation_vector_state is None:
+            raise ValueError(
+                "continuous rotation-vector observations require online state"
+            )
+        axis_angle = rotation_vector_state.convert(quaternion)
+    else:
+        axis_angle = T.quat2axisangle(quaternion.copy()).astype(np.float32)
     return np.concatenate((position, axis_angle), axis=0)
 
 
@@ -135,6 +171,17 @@ class EnvRobosuite(EB.EnvBase):
         self.eef_pose_observation_config = normalize_eef_pose_observation_config(
             kwargs.pop("eef_pose_observation", None)
         )
+        self._eef_pose_rotation_state = None
+        if (
+            self.eef_pose_observation_config["enabled"]
+            and self.eef_pose_observation_config["rotation_vector_mode"]
+            == "continuous"
+        ):
+            self._eef_pose_rotation_state = ContinuousRotationVectorState(
+                self.eef_pose_observation_config[
+                    "reference_quaternion_xyzw"
+                ]
+            )
         self.target_mask_image_config = kwargs.pop("target_mask_image", None)
         self.target_pointcloud_config = TargetPointCloudUtils.normalize_target_pointcloud_config(
             kwargs.pop("target_pointcloud", {"enabled": False})
@@ -244,6 +291,7 @@ class EnvRobosuite(EB.EnvBase):
         Returns:
             observation (dict): initial observation dictionary.
         """
+        self._reset_eef_pose_rotation_state()
         if unset_ep_meta and self.is_v15_or_higher:
             # unset the ep meta to clear out any ep meta that was previously set
             # (this feature was set from robosuite v1.5 onwards)
@@ -296,6 +344,7 @@ class EnvRobosuite(EB.EnvBase):
             self.env.sim.set_state_from_flattened(state["states"])
             self.env.sim.forward()
             self._refresh_robot_controllers()
+            self._reset_eef_pose_rotation_state()
             should_ret = True
 
         if "goal" in state:
@@ -383,6 +432,7 @@ class EnvRobosuite(EB.EnvBase):
                 eef_pose_observation_from_raw(
                     ret,
                     self.eef_pose_observation_config,
+                    rotation_vector_state=self._eef_pose_rotation_state,
                 )
             )
         ret = TargetMaskUtils.apply_target_mask_images_to_obs(
@@ -398,6 +448,10 @@ class EnvRobosuite(EB.EnvBase):
                 )
             )
         return ret
+
+    def _reset_eef_pose_rotation_state(self):
+        if self._eef_pose_rotation_state is not None:
+            self._eef_pose_rotation_state.reset()
 
     def get_real_depth_map(self, depth_map):
         """
