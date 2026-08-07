@@ -112,6 +112,36 @@ def test_guidance_gradient_includes_denoiser_jacobian():
     assert np.isfinite(diagnostics.noisy_action_gradient_norm)
 
 
+def test_guidance_gradient_skips_backward_outside_safety_distance(monkeypatch):
+    noise_scheduler = scheduler(prediction_type="sample", clip_sample=False)
+    noisy = torch.zeros((1, 2, 7), requires_grad=True)
+    model_output = noisy + 1.0
+    context = PaperLanGuidanceContext(
+        current_eef_pos=np.zeros(3),
+        obstacle_points=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        action_scale=np.ones(7),
+        action_offset=np.zeros(7),
+        guidance_scale=0.1,
+        safety_distance=0.03,
+    )
+
+    def unexpected_backward(*args, **kwargs):
+        raise AssertionError("inactive guidance should not invoke autograd.grad")
+
+    monkeypatch.setattr(torch.autograd, "grad", unexpected_backward)
+    update, diagnostics = paper_guidance_gradient(
+        noisy_action=noisy,
+        model_output=model_output,
+        timestep=torch.tensor(5),
+        scheduler=noise_scheduler,
+        context=context,
+    )
+
+    assert torch.count_nonzero(update) == 0
+    assert diagnostics.active_waypoint_count == 0
+    assert diagnostics.noisy_action_gradient_norm == 0.0
+
+
 def test_context_validation():
     with pytest.raises(ValueError, match="safety_distance"):
         PaperLanGuidanceContext(

@@ -204,18 +204,24 @@ def paper_guidance_gradient(
         xy_only=context.xy_only,
         norm_epsilon=context.norm_epsilon,
     )
-    gradient = torch.autograd.grad(
-        cost,
-        noisy_action,
-        retain_graph=False,
-        create_graph=False,
-    )[0]
+    active_waypoint_count = int(torch.count_nonzero(penetrations > 0).item())
+    if active_waypoint_count:
+        gradient = torch.autograd.grad(
+            cost,
+            noisy_action,
+            retain_graph=False,
+            create_graph=False,
+        )[0]
+    else:
+        # ReLU is locally constant when every waypoint is outside Q*. Avoid a
+        # mathematically redundant backward pass through the full denoiser.
+        gradient = torch.zeros_like(noisy_action)
     update = float(context.guidance_scale) * gradient
     timestep_index = int(timestep.item()) if torch.is_tensor(timestep) else int(timestep)
     diagnostics = PaperLanGuidanceDiagnostics(
         timestep=timestep_index,
         closest_obstacle_point=obstacle_point.detach().cpu().tolist(),
-        active_waypoint_count=int(torch.count_nonzero(penetrations > 0).item()),
+        active_waypoint_count=active_waypoint_count,
         cost=float(cost.detach().item()),
         minimum_distance_m=float(torch.min(distances).detach().item()),
         noisy_action_gradient_norm=float(torch.linalg.vector_norm(gradient).detach().item()),
