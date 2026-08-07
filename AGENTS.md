@@ -3,10 +3,11 @@
 > Forked robomimic used by the parent project for clean-image Diffusion Policy
 > training and rollout on executable EEF-pose OSC action targets.
 
-> **Status (2026-07-29)**: targeted positive BC, a lower-exposure control, and
-> paper-aligned SDP set supervision have completed. All add local corrective
-> support but miss the paired D2 task gate. Preserve these training paths and
-> the earlier LAN / guided code as reproducible baselines.
+> **Status (2026-08-07)**: the paper-aligned D2 guidance stage is archived with
+> zero collision-to-clear transitions. The active Empty2D mechanism test uses
+> standard low-dimensional Diffusion Policy plus a generic opt-in 2-D/3-D
+> predicted-clean point-trajectory guidance variant. Its data and batch-256
+> preflight gates pass; formal training is unrun.
 
 ## 1. Architecture Overview
 
@@ -40,6 +41,7 @@ algo class.
 | `GuidedDiffusionPolicyUNet` | `algo/guided_diffusion_policy.py` | Registered opt-in DDIM guided variant |
 | `LanO3DPUNet` | `algo/lan_o3dp.py` | LAN-aligned point-cloud diffusion policy |
 | `GuidedLanO3DPUNet` | `algo/lan_o3dp.py` | Opt-in guided LAN variant for DDPM checkpoints |
+| `PointGuidedDiffusionPolicyUNet` | `algo/point_guided_diffusion_policy.py` | Generic paper-gradient guidance for arbitrary 2-D/3-D absolute position action indices |
 | `DP3PointCloudCore` | `models/obs_core.py` | 3→32→64→64 per-point MLP, residual, max-pool, 64-D output |
 | `RolloutPolicy` | `algo/algo.py` | Rollout wrapper: obs norm, action unnorm, policy call |
 
@@ -83,6 +85,7 @@ registered guided variant without rewriting the checkpoint.
 | `robomimic/exps/absolute_eef_osc/diffusion_policy_can_image.json` | `abs_eef_pose_action` | Absolute EEF comparison baseline |
 | `robomimic/exps/delta_eef_pose_osc/diffusion_policy_can_pointcloud_ddpm100.json` | `delta_eef_pose_action` | Completed seed-500 point-cloud DDPM100 baseline |
 | `robomimic/exps/delta_eef_pose_osc/lan_o3dp_can_delta_pose_eps_residual_40demo_seed42.json` | `delta_eef_pose_action` | Completed LAN-aligned 40-demo baseline |
+| `robomimic/exps/empty2d_guidance/diffusion_policy_sample_seed42.json` | `actions` | Active low-dimensional absolute-XY Empty2D source |
 
 The clean-image delta and absolute configs use DDIM with
 `num_train_timesteps=100`, `num_inference_timesteps=10`, and min-max action
@@ -140,6 +143,13 @@ not the starting point for targeted fine-tuning.
   `RolloutPolicy.action_normalization_stats`, then call
   `policy.policy.set_guidance_context(...)` after `start_episode` and before a
   new action chunk is sampled.
+- `experiment.logging.wandb_required=true` is fail-fast: it requires online
+  initialization, aborts on initialization or logging failure, and writes
+  `logs/wandb_run.json` with run ID, URL, full config, and checkpoint mapping.
+- `point_guided_policy_from_checkpoint` adapts an ordinary
+  `diffusion_policy` checkpoint in memory. Its context names one action key and
+  two or three local position indices; the obstacle point is fixed once per
+  sampled chunk. The legacy paper-LAN 3-D API and behavior remain compatible.
 - The RGB guided variant uses DDIM. The guided LAN variant also accepts DDPM
   scheduler outputs with a predicted clean sample. Both evaluate the executed
   `[:, 1:9]` clean-action slice and directly update only that slice's XY
@@ -157,6 +167,10 @@ uv run pytest -q \
   third_party/robomimic/tests/test_observation_min_max_normalization.py \
   third_party/robomimic/tests/test_rollout_checkpoint_selection.py
 ```
+
+The Empty2D addition is covered by
+`tests/test_point_trajectory_guidance.py`, `tests/test_wandb_required.py`, and
+the unchanged `tests/test_paper_lan_guidance.py` suite in the parent command.
 
 The tests cover reconstruction, point versus displacement normalization,
 finite cost gradients, pushed-waypoint differencing, recorded before / after

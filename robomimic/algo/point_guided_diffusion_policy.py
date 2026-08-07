@@ -1,4 +1,4 @@
-"""LAN-O3DP inference using the paper's full clean-estimate gradient."""
+"""Generic predicted-clean point-trajectory guidance for Diffusion Policy."""
 
 from dataclasses import replace
 
@@ -6,34 +6,36 @@ import torch
 
 import robomimic.utils.tensor_utils as TensorUtils
 from robomimic.algo import register_algo_factory_func
-from robomimic.algo.lan_o3dp import LanO3DPUNet
+from robomimic.algo.diffusion_policy import DiffusionPolicyUNet
 from robomimic.utils.paper_lan_guidance_utils import (
     closest_obstacle_point,
     paper_guidance_gradient,
 )
 
 
-@register_algo_factory_func("paper_guided_lan_o3dp")
+@register_algo_factory_func("point_guided_diffusion_policy")
 def algo_config_to_class(algo_config):
     if algo_config.unet.enabled:
-        return PaperGuidedLanO3DPUNet, {}
+        return PointGuidedDiffusionPolicyUNet, {}
     if algo_config.transformer.enabled:
         raise NotImplementedError()
     raise RuntimeError()
 
 
-class PaperGuidedLanO3DPUNet(LanO3DPUNet):
-    """Apply ``A_{k-1} -= rho * grad_{A_k} D(A_{0|k}, C_ob)``."""
+class PointGuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
+    """Apply the LAN paper update to arbitrary absolute position indices."""
 
     def _create_networks(self):
-        super(PaperGuidedLanO3DPUNet, self)._create_networks()
+        super()._create_networks()
         self.guidance_context = None
         self.guidance_diagnostics = []
+        self.last_predicted_action_chunk = None
 
     def reset(self):
-        super(PaperGuidedLanO3DPUNet, self).reset()
+        super().reset()
         self.guidance_context = None
         self.guidance_diagnostics = []
+        self.last_predicted_action_chunk = None
 
     def set_guidance_context(self, context):
         self.guidance_context = context
@@ -78,8 +80,11 @@ class PaperGuidedLanO3DPUNet(LanO3DPUNet):
         self.guidance_diagnostics = []
         context = self.guidance_context
         if context is not None and context.enabled and context.guidance_scale > 0:
-            # Algorithm 1 chooses C_ob once, before the reverse process. Keep
-            # only that point so no denoising iterate can change the choice.
+            dimensions = (
+                min(2, len(context.position_indices))
+                if context.xy_only
+                else len(context.position_indices)
+            )
             fixed_point = closest_obstacle_point(
                 context.current_eef_pos,
                 torch.as_tensor(
@@ -88,23 +93,13 @@ class PaperGuidedLanO3DPUNet(LanO3DPUNet):
                     dtype=noisy_action.dtype,
                 ),
                 xy_only=context.xy_only,
-                dimensions=(
-                    min(2, len(context.position_indices))
-                    if context.xy_only
-                    else len(context.position_indices)
-                ),
+                dimensions=dimensions,
             )
-            context = replace(
-                context,
-                obstacle_points=fixed_point.detach().reshape(1, -1),
-            )
+            context = replace(context, obstacle_points=fixed_point.detach().reshape(1, -1))
+
         for timestep in self.noise_scheduler.timesteps:
-            guidance_enabled = (
-                context is not None
-                and context.enabled
-                and context.guidance_scale > 0
-            )
-            if guidance_enabled:
+            enabled = context is not None and context.enabled and context.guidance_scale > 0
+            if enabled:
                 with torch.enable_grad():
                     current = noisy_action.detach().requires_grad_(True)
                     model_output = nets["policy"]["noise_pred_net"](
@@ -141,4 +136,6 @@ class PaperGuidedLanO3DPUNet(LanO3DPUNet):
                     ).prev_sample
 
         start = observation_horizon - 1
-        return noisy_action[:, start : start + action_horizon]
+        action = noisy_action[:, start : start + action_horizon]
+        self.last_predicted_action_chunk = action.detach().cpu()
+        return action

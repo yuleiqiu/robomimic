@@ -1,0 +1,122 @@
+{
+    "algo_name": "diffusion_policy",
+    "experiment": {
+        "name": "empty2d_guidance_sample_seed42",
+        "validate": true,
+        "logging": {
+            "terminal_output_to_txt": true,
+            "log_tb": true,
+            "log_wandb": true,
+            "wandb_proj_name": "empty2d_guidance",
+            "wandb_required": true
+        },
+        "save": {
+            "enabled": true,
+            "every_n_seconds": null,
+            "every_n_epochs": 100,
+            "epochs": [100, 200, 300, 400, 500],
+            "on_best_validation": false,
+            "on_best_rollout_return": false,
+            "on_best_rollout_success_rate": false,
+            "latest_every_n_epochs": 500
+        },
+        "epoch_every_n_steps": null,
+        "validation_epoch_every_n_steps": null,
+        "render": false,
+        "render_video": false,
+        "rollout": {
+            "enabled": false,
+            "n": 0,
+            "horizon": 320,
+            "rate": 100,
+            "warmstart": 0,
+            "terminate_on_success": true
+        }
+    },
+    "train": {
+        "data": [{
+            "path": "outputs/empty2d_guidance/data/empty2d_guidance.hdf5",
+            "eval": false
+        }],
+        "output_dir": "../../../outputs/robomimic/train",
+        "num_data_workers": 0,
+        "hdf5_cache_mode": "all",
+        "hdf5_use_swmr": true,
+        "hdf5_load_next_obs": false,
+        "hdf5_normalize_obs": true,
+        "hdf5_filter_key": "train",
+        "hdf5_validation_filter_key": "valid",
+        "seq_length": 16,
+        "pad_seq_length": true,
+        "frame_stack": 2,
+        "pad_frame_stack": true,
+        "dataset_keys": ["actions", "rewards", "dones"],
+        "action_keys": ["actions"],
+        "action_config": {
+            "actions": {"normalization": "min_max"}
+        },
+        "observation_config": {
+            "agent_pos": {"normalization": "min_max", "last_n_dims": 1}
+        },
+        "goal_mode": null,
+        "cuda": true,
+        "batch_size": 256,
+        "num_epochs": 500,
+        "seed": 42,
+        "max_grad_norm": null
+    },
+    "algo": {
+        "optim_params": {
+            "policy": {
+                "optimizer_type": "adamw",
+                "learning_rate": {
+                    "initial": 0.0001,
+                    "decay_factor": 0.1,
+                    "step_every_batch": true,
+                    "scheduler_type": "cosine",
+                    "num_cycles": 0.5,
+                    "warmup_steps": 500,
+                    "epoch_schedule": []
+                },
+                "regularization": {"L2": 0.000001}
+            }
+        },
+        "horizon": {
+            "observation_horizon": 2,
+            "action_horizon": 8,
+            "prediction_horizon": 16
+        },
+        "unet": {
+            "enabled": true,
+            "diffusion_step_embed_dim": 256,
+            "down_dims": [256, 512, 1024],
+            "kernel_size": 5,
+            "n_groups": 8,
+            "cond_predict_scale": true
+        },
+        "ema": {"enabled": true, "power": 0.75},
+        "ddpm": {
+            "enabled": true,
+            "num_train_timesteps": 100,
+            "num_inference_timesteps": 100,
+            "beta_schedule": "squaredcos_cap_v2",
+            "clip_sample": true,
+            "prediction_type": "sample"
+        },
+        "ddim": {"enabled": false}
+    },
+    "observation": {
+        "modalities": {
+            "obs": {"low_dim": ["agent_pos"], "rgb": [], "depth": [], "scan": []},
+            "goal": {"low_dim": [], "rgb": [], "depth": [], "scan": []}
+        },
+        "encoder": {
+            "low_dim": {
+                "core_class": null,
+                "core_kwargs": {},
+                "obs_randomizer_class": null,
+                "obs_randomizer_kwargs": {}
+            }
+        }
+    }
+}

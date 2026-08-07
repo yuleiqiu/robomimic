@@ -3,6 +3,7 @@ This file contains utility classes and functions for logging to stdout, stderr,
 and to tensorboard.
 """
 import os
+import json
 import sys
 import numpy as np
 from datetime import datetime
@@ -49,7 +50,16 @@ class DataLogger(object):
         """
         self._tb_logger = None
         self._wandb_logger = None
+        self._wandb_run = None
+        self._wandb_required = bool(
+            config.experiment.logging.get("wandb_required", False)
+        )
+        self._wandb_manifest_path = os.path.join(log_dir, "wandb_run.json")
+        self._wandb_manifest = None
         self._data = dict() # store all the scalar data logged so far
+
+        if self._wandb_required and not log_wandb:
+            raise ValueError("wandb_required=true requires log_wandb=true")
 
         if log_tb:
             from tensorboardX import SummaryWriter
@@ -67,20 +77,27 @@ class DataLogger(object):
                     "\nSet this macro in {base_path}/macros_private.py" \
                     "\nIf this file does not exist, first run python {base_path}/scripts/setup_macros.py".format(base_path=robomimic.__path__[0])
             
-            # attempt to set up wandb 10 times. If unsuccessful after these trials, don't use wandb
-            num_attempts = 10
+            # Required experiment runs fail fast and never silently switch to
+            # offline mode. Historical optional runs retain retry + fallback.
+            num_attempts = 1 if self._wandb_required else 10
             for attempt in range(num_attempts):
                 try:
                     # set up wandb
                     self._wandb_logger = wandb
 
-                    self._wandb_logger.init(
+                    self._wandb_run = self._wandb_logger.init(
                         entity=Macros.WANDB_ENTITY,
                         project=config.experiment.logging.wandb_proj_name,
                         name=config.experiment.name,
                         dir=log_dir,
-                        mode=("offline" if attempt == num_attempts - 1 else "online"),
+                        mode=(
+                            "online"
+                            if self._wandb_required or attempt < num_attempts - 1
+                            else "offline"
+                        ),
                     )
+                    if self._wandb_run is None:
+                        raise RuntimeError("wandb.init returned no active run")
 
                     # set up info for identifying experiment
                     wandb_config = {k: v for (k, v) in config.meta.items() if k not in ["hp_keys", "hp_values"]}
@@ -88,13 +105,68 @@ class DataLogger(object):
                         wandb_config[k] = v
                     if "algo" not in wandb_config:
                         wandb_config["algo"] = config.algo_name
+                    wandb_config["robomimic_config"] = json.loads(
+                        json.dumps(config)
+                    )
                     self._wandb_logger.config.update(wandb_config)
+
+                    self._wandb_manifest = {
+                        "run_id": self._wandb_run.id,
+                        "run_url": self._wandb_run.url,
+                        "entity": Macros.WANDB_ENTITY,
+                        "project": config.experiment.logging.wandb_proj_name,
+                        "name": config.experiment.name,
+                        "mode": "online" if self._wandb_required else self._wandb_run.settings.mode,
+                        "required": self._wandb_required,
+                        "config": json.loads(json.dumps(config)),
+                        "checkpoints": [],
+                    }
+                    self._write_wandb_manifest()
 
                     break
                 except Exception as e:
                     log_warning("wandb initialization error (attempt #{}): {}".format(attempt + 1, e))
                     self._wandb_logger = None
+                    self._wandb_run = None
+                    if self._wandb_required:
+                        raise RuntimeError(
+                            "Required online W&B initialization failed"
+                        ) from e
                     time.sleep(30)
+
+    def _write_wandb_manifest(self):
+        if self._wandb_manifest is None:
+            return
+        temporary = self._wandb_manifest_path + ".tmp"
+        with open(temporary, "w") as stream:
+            json.dump(self._wandb_manifest, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        os.replace(temporary, self._wandb_manifest_path)
+
+    def record_checkpoint(self, path, epoch, kind):
+        """Persist the W&B run-to-checkpoint correspondence."""
+
+        if self._wandb_manifest is None:
+            return
+        self._wandb_manifest["checkpoints"].append(
+            {
+                "path": os.path.abspath(path),
+                "epoch": int(epoch),
+                "kind": str(kind),
+            }
+        )
+        self._write_wandb_manifest()
+        try:
+            self._wandb_logger.config.update(
+                {"checkpoint_map": self._wandb_manifest["checkpoints"]},
+                allow_val_change=True,
+            )
+        except Exception as error:
+            if self._wandb_required:
+                raise RuntimeError(
+                    "Required online W&B checkpoint mapping failed"
+                ) from error
+            log_warning("wandb checkpoint mapping: {}".format(error))
 
     def record(self, k, v, epoch, data_type='scalar', log_stats=False):
         """
@@ -142,6 +214,8 @@ class DataLogger(object):
                     import wandb
                     self._wandb_logger.log({k: wandb.Image(v)}, step=epoch)
             except Exception as e:
+                if self._wandb_required:
+                    raise RuntimeError("Required online W&B logging failed") from e
                 log_warning("wandb logging: {}".format(e))
 
     def get_stats(self, k):

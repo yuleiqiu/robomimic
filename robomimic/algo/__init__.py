@@ -13,3 +13,4 @@ from robomimic.algo.diffusion_policy import DiffusionPolicyUNet
 from robomimic.algo.guided_diffusion_policy import GuidedDiffusionPolicyUNet, GuidedLanO3DPUNet
 from robomimic.algo.lan_o3dp import LanO3DPUNet
 from robomimic.algo.paper_guided_lan_o3dp import PaperGuidedLanO3DPUNet
+from robomimic.algo.point_guided_diffusion_policy import PointGuidedDiffusionPolicyUNet

@@ -491,15 +491,21 @@ def train(config, device, resume=False):
 
         # Save model checkpoints based on conditions (success rate, validation loss, etc)
         if should_save_ckpt:    
+            checkpoint_path = os.path.join(ckpt_dir, epoch_ckpt_name + ".pth")
             TrainUtils.save_model(
                 model=model,
                 config=config,
                 env_meta=env_meta_list[0] if len(env_meta_list)==1 else env_meta_list,
                 shape_meta=shape_meta_list[0] if len(shape_meta_list)==1 else shape_meta_list,
                 variable_state=variable_state,
-                ckpt_path=os.path.join(ckpt_dir, epoch_ckpt_name + ".pth"),
+                ckpt_path=checkpoint_path,
                 obs_normalization_stats=obs_normalization_stats,
                 action_normalization_stats=action_normalization_stats,
+            )
+            data_logger.record_checkpoint(
+                checkpoint_path,
+                epoch=epoch,
+                kind="scheduled",
             )
 
         # Save the resumable latest pair at a configurable frequency. Large
@@ -526,6 +532,11 @@ def train(config, device, resume=False):
 
             # keep a backup model in case last.pth is malformed (e.g. job died last time during saving)
             shutil.copyfile(latest_model_path, latest_model_backup_path)
+            data_logger.record_checkpoint(
+                latest_model_path,
+                epoch=epoch,
+                kind="latest",
+            )
             print("\nsaved backup of latest model at {}\n".format(latest_model_backup_path))
 
         # Finally, log memory usage in MB
