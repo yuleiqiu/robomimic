@@ -16,3 +16,4 @@ from robomimic.config.lan_o3dp_config import LanO3DPConfig
 from robomimic.config.guided_lan_o3dp_config import GuidedLanO3DPConfig
 from robomimic.config.paper_guided_lan_o3dp_config import PaperGuidedLanO3DPConfig
 from robomimic.config.point_guided_diffusion_policy_config import PointGuidedDiffusionPolicyConfig
+from robomimic.config.ellipsoid_guided_diffusion_policy_config import EllipsoidGuidedDiffusionPolicyConfig
