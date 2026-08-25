@@ -22,6 +22,9 @@ DEFAULT_POINTCLOUD_CONFIG = {
     "width": 256,
     "target_object": "Can",
     "include_visual_goal": True,
+    # Optional explicit task-goal object names. When omitted, the historical
+    # Visual<target> convention is preserved.
+    "goal_objects": None,
     "num_points": 512,
     "padding_mode": "repeat",
     # Reject transparent-goal segmentation pixels whose depth belongs to an
@@ -55,6 +58,16 @@ def normalize_target_pointcloud_config(config):
         if not isinstance(normalized[key], str) or not normalized[key]:
             raise ValueError("{} must be a non-empty string".format(key))
     normalized["include_visual_goal"] = bool(normalized["include_visual_goal"])
+    goal_objects = normalized.get("goal_objects")
+    if goal_objects is not None:
+        if isinstance(goal_objects, str):
+            goal_objects = [goal_objects]
+        if not isinstance(goal_objects, (list, tuple)) or not all(
+            isinstance(name, str) and name for name in goal_objects
+        ):
+            raise ValueError("goal_objects must be null, a string, or non-empty strings")
+        goal_objects = list(goal_objects)
+    normalized["goal_objects"] = goal_objects
     if normalized["padding_mode"] not in ("repeat", "zero"):
         raise ValueError("padding_mode must be 'repeat' or 'zero'")
     max_geom_distance = normalized.get("max_geom_distance")
@@ -66,7 +79,12 @@ def normalize_target_pointcloud_config(config):
     return normalized
 
 
-def get_target_and_goal_geom_ids(raw_env, target_object="Can", include_visual_goal=True):
+def get_target_and_goal_geom_ids(
+    raw_env,
+    target_object="Can",
+    include_visual_goal=True,
+    goal_objects=None,
+):
     """
     Select exactly ``<target>_*`` and optionally ``Visual<target>_*`` geoms.
 
@@ -76,6 +94,10 @@ def get_target_and_goal_geom_ids(raw_env, target_object="Can", include_visual_go
     prefixes = ["{}_".format(target_object)]
     if include_visual_goal:
         prefixes.append("Visual{}_".format(target_object))
+    if goal_objects is not None:
+        if isinstance(goal_objects, str):
+            goal_objects = [goal_objects]
+        prefixes.extend("{}_".format(name) for name in goal_objects)
 
     geom_ids = []
     for geom_id in range(raw_env.sim.model.ngeom):
@@ -174,6 +196,7 @@ def render_target_pointcloud(raw_env, config=None, target_geom_ids=None, return_
             raw_env=raw_env,
             target_object=config["target_object"],
             include_visual_goal=config["include_visual_goal"],
+            goal_objects=config["goal_objects"],
         )
 
     segmentation, normalized_depth = raw_env.sim.render(

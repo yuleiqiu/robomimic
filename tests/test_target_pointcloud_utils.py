@@ -4,9 +4,24 @@ import numpy as np
 
 from robomimic.utils.target_pointcloud_utils import (
     deterministic_farthest_point_sample,
+    get_target_and_goal_geom_ids,
     normalize_target_pointcloud_config,
     unproject_depth_pixels_to_world,
 )
+
+
+class _FakeGeomModel:
+    def __init__(self, names):
+        self.names = names
+        self.ngeom = len(names)
+
+    def geom_id2name(self, geom_id):
+        return self.names[geom_id]
+
+
+class _FakeRawEnv:
+    def __init__(self, names):
+        self.sim = type("FakeSim", (), {"model": _FakeGeomModel(names)})()
 
 
 class TestTargetPointCloudUtils(unittest.TestCase):
@@ -62,6 +77,31 @@ class TestTargetPointCloudUtils(unittest.TestCase):
             normalize_target_pointcloud_config({"height": 0})
         with self.assertRaises(ValueError):
             normalize_target_pointcloud_config({"padding_mode": "invalid"})
+        explicit_goal = normalize_target_pointcloud_config(
+            {"include_visual_goal": False, "goal_objects": "GoalTray"}
+        )
+        self.assertEqual(explicit_goal["goal_objects"], ["GoalTray"])
+        with self.assertRaises(ValueError):
+            normalize_target_pointcloud_config({"goal_objects": [""]})
+
+    def test_explicit_goal_objects_exclude_obstacles(self):
+        env = _FakeRawEnv(
+            [
+                "Can_g0",
+                "Can_g0_visual",
+                "GoalTray_base",
+                "GoalTray_wall0",
+                "Milk_g0",
+                "table_collision",
+            ]
+        )
+        geom_ids = get_target_and_goal_geom_ids(
+            env,
+            target_object="Can",
+            include_visual_goal=False,
+            goal_objects=["GoalTray"],
+        )
+        self.assertEqual(geom_ids, (0, 1, 2, 3))
 
 
 if __name__ == "__main__":
