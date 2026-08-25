@@ -4,6 +4,7 @@ import numpy as np
 
 from robomimic.utils.target_pointcloud_utils import (
     deterministic_farthest_point_sample,
+    fuse_and_sample_pointcloud_views,
     get_target_and_goal_geom_ids,
     normalize_target_pointcloud_config,
     unproject_depth_pixels_to_world,
@@ -56,6 +57,25 @@ class TestTargetPointCloudUtils(unittest.TestCase):
         sampled = deterministic_farthest_point_sample(points, 5)
         np.testing.assert_array_equal(sampled, points[[0, 1, 0, 1, 0]])
 
+    def test_multi_view_fusion_samples_once_in_world_frame(self):
+        agentview = np.array([[0, 0, 0], [1, 0, 0]], dtype=np.float32)
+        backview = np.array([[0, 1, 0], [1, 1, 0]], dtype=np.float32)
+        fused = fuse_and_sample_pointcloud_views(
+            [agentview, np.empty((0, 3), dtype=np.float32), backview],
+            4,
+        )
+        assert {tuple(point) for point in fused} == {
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (1.0, 1.0, 0.0),
+        }
+        with self.assertRaisesRegex(ValueError, "only empty"):
+            fuse_and_sample_pointcloud_views(
+                [np.empty((0, 3), dtype=np.float32)],
+                4,
+            )
+
     def test_zero_padding_matches_official_lan_preprocessing(self):
         points = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
         sampled = deterministic_farthest_point_sample(
@@ -73,10 +93,20 @@ class TestTargetPointCloudUtils(unittest.TestCase):
         self.assertEqual(config["num_points"], 12)
         self.assertEqual(config["obs_key"], "task_pointcloud")
         self.assertEqual(config["padding_mode"], "repeat")
+        self.assertEqual(config["camera_names"], ["agentview"])
+        multi_view = normalize_target_pointcloud_config(
+            {"camera_names": ["agentview", "backview"]}
+        )
+        self.assertEqual(multi_view["camera_name"], "agentview")
+        self.assertEqual(multi_view["camera_names"], ["agentview", "backview"])
         with self.assertRaises(ValueError):
             normalize_target_pointcloud_config({"height": 0})
         with self.assertRaises(ValueError):
             normalize_target_pointcloud_config({"padding_mode": "invalid"})
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            normalize_target_pointcloud_config(
+                {"camera_names": ["agentview", "agentview"]}
+            )
         explicit_goal = normalize_target_pointcloud_config(
             {"include_visual_goal": False, "goal_objects": "GoalTray"}
         )

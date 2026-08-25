@@ -1,5 +1,5 @@
 """
-Deterministic target-object point clouds for robosuite environments.
+Deterministic single- or multi-view point clouds for robosuite environments.
 
 The extractor intentionally uses oracle MuJoCo geom segmentation. It merges the
 active target object with its translucent ``Visual<target>`` goal marker and
@@ -17,7 +17,11 @@ POINTCLOUD_OBS_KEY = "task_pointcloud"
 DEFAULT_POINTCLOUD_CONFIG = {
     "enabled": True,
     "obs_key": POINTCLOUD_OBS_KEY,
+    # ``camera_name`` is the backward-compatible single-view spelling.
+    # Supplying ``camera_names`` renders every listed view, concatenates their
+    # world-frame points, and applies one deterministic FPS to the fused set.
     "camera_name": "agentview",
+    "camera_names": None,
     "height": 256,
     "width": 256,
     "target_object": "Can",
@@ -38,6 +42,8 @@ class TargetPointCloudRender:
     points: np.ndarray
     valid_points: np.ndarray
     target_geom_ids: tuple
+    camera_names: tuple
+    valid_point_counts: tuple
 
 
 def normalize_target_pointcloud_config(config):
@@ -57,6 +63,19 @@ def normalize_target_pointcloud_config(config):
     for key in ("obs_key", "camera_name", "target_object"):
         if not isinstance(normalized[key], str) or not normalized[key]:
             raise ValueError("{} must be a non-empty string".format(key))
+    camera_names = normalized.get("camera_names")
+    if camera_names is None:
+        camera_names = [normalized["camera_name"]]
+    elif isinstance(camera_names, str):
+        camera_names = [camera_names]
+    if not isinstance(camera_names, (list, tuple)) or not camera_names or not all(
+        isinstance(name, str) and name for name in camera_names
+    ):
+        raise ValueError("camera_names must be null, a string, or non-empty strings")
+    if len(set(camera_names)) != len(camera_names):
+        raise ValueError("camera_names must not contain duplicates")
+    normalized["camera_names"] = list(camera_names)
+    normalized["camera_name"] = camera_names[0]
     normalized["include_visual_goal"] = bool(normalized["include_visual_goal"])
     goal_objects = normalized.get("goal_objects")
     if goal_objects is not None:
@@ -186,8 +205,34 @@ def deterministic_farthest_point_sample(
     return points[selected].copy()
 
 
+def fuse_and_sample_pointcloud_views(
+    pointclouds,
+    num_points,
+    padding_mode="repeat",
+):
+    """Fuse non-empty world-frame views, then deterministically sample once."""
+
+    validated = []
+    for index, points in enumerate(pointclouds):
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(
+                "pointclouds[{}] must have shape (N, 3)".format(index)
+            )
+        if len(points):
+            validated.append(points)
+    if not validated:
+        raise ValueError("Cannot fuse only empty point-cloud views")
+    fused = np.concatenate(validated, axis=0)
+    return deterministic_farthest_point_sample(
+        fused,
+        num_points,
+        padding_mode=padding_mode,
+    )
+
+
 def render_target_pointcloud(raw_env, config=None, target_geom_ids=None, return_details=False):
-    """Render and extract one fixed-size world-frame target point cloud."""
+    """Render, fuse, and sample a fixed-size world-frame point cloud."""
     config = normalize_target_pointcloud_config(config or {})
     if not config["enabled"]:
         raise ValueError("Cannot render a disabled target_pointcloud provider")
@@ -199,55 +244,74 @@ def render_target_pointcloud(raw_env, config=None, target_geom_ids=None, return_
             goal_objects=config["goal_objects"],
         )
 
-    segmentation, normalized_depth = raw_env.sim.render(
-        camera_name=config["camera_name"],
-        height=config["height"],
-        width=config["width"],
-        depth=True,
-        segmentation=True,
-    )
-    # MuJoCo renders bottom-up; robomimic observations use a top-left origin.
-    segmentation = segmentation[::-1]
-    normalized_depth = normalized_depth[::-1]
-    geom_ids = segmentation[..., 1]
-    mask = np.isin(geom_ids, np.asarray(target_geom_ids))
-    pixels_rc = np.argwhere(mask)
-    if len(pixels_rc) == 0:
+    valid_by_camera = []
+    valid_point_counts = []
+    target_geom_ids_array = np.asarray(target_geom_ids)
+    for camera_name in config["camera_names"]:
+        segmentation, normalized_depth = raw_env.sim.render(
+            camera_name=camera_name,
+            height=config["height"],
+            width=config["width"],
+            depth=True,
+            segmentation=True,
+        )
+        # MuJoCo renders bottom-up; robomimic observations use a top-left origin.
+        segmentation = segmentation[::-1]
+        normalized_depth = normalized_depth[::-1]
+        geom_ids = segmentation[..., 1]
+        mask = np.isin(geom_ids, target_geom_ids_array)
+        pixels_rc = np.argwhere(mask)
+        if len(pixels_rc) == 0:
+            valid_by_camera.append(np.empty((0, 3), dtype=np.float32))
+            valid_point_counts.append(0)
+            continue
+
+        depth_m = CameraUtils.get_real_depth_map(raw_env.sim, normalized_depth)
+        intrinsic = CameraUtils.get_camera_intrinsic_matrix(
+            raw_env.sim,
+            camera_name=camera_name,
+            camera_height=config["height"],
+            camera_width=config["width"],
+        )
+        camera_pose = CameraUtils.get_camera_extrinsic_matrix(
+            raw_env.sim, camera_name=camera_name
+        )
+        valid_points = unproject_depth_pixels_to_world(
+            depth_m=depth_m,
+            pixels_rc=pixels_rc,
+            intrinsic=intrinsic,
+            camera_pose=camera_pose,
+        )
+        finite = np.isfinite(valid_points).all(axis=1)
+        if config["max_geom_distance"] is not None:
+            pixel_geom_ids = geom_ids[mask]
+            geom_centers = np.asarray(
+                [raw_env.sim.data.geom_xpos[int(geom_id)] for geom_id in pixel_geom_ids]
+            )
+            finite &= (
+                np.linalg.norm(
+                    valid_points.astype(np.float64) - geom_centers,
+                    axis=1,
+                )
+                <= config["max_geom_distance"]
+            )
+        valid_points = valid_points[finite]
+        valid_by_camera.append(valid_points)
+        valid_point_counts.append(len(valid_points))
+
+    if not any(valid_point_counts):
         raise RuntimeError(
-            "No target pixels rendered for geoms {} from camera {!r}".format(
-                target_geom_ids, config["camera_name"]
+            "No target pixels rendered for geoms {} from cameras {}".format(
+                target_geom_ids,
+                config["camera_names"],
             )
         )
-
-    depth_m = CameraUtils.get_real_depth_map(raw_env.sim, normalized_depth)
-    intrinsic = CameraUtils.get_camera_intrinsic_matrix(
-        raw_env.sim,
-        camera_name=config["camera_name"],
-        camera_height=config["height"],
-        camera_width=config["width"],
+    valid_points = np.concatenate(
+        [points for points in valid_by_camera if len(points)],
+        axis=0,
     )
-    camera_pose = CameraUtils.get_camera_extrinsic_matrix(
-        raw_env.sim, camera_name=config["camera_name"]
-    )
-    valid_points = unproject_depth_pixels_to_world(
-        depth_m=depth_m,
-        pixels_rc=pixels_rc,
-        intrinsic=intrinsic,
-        camera_pose=camera_pose,
-    )
-    finite = np.isfinite(valid_points).all(axis=1)
-    if config["max_geom_distance"] is not None:
-        pixel_geom_ids = geom_ids[mask]
-        geom_centers = np.asarray(
-            [raw_env.sim.data.geom_xpos[int(geom_id)] for geom_id in pixel_geom_ids]
-        )
-        finite &= (
-            np.linalg.norm(valid_points.astype(np.float64) - geom_centers, axis=1)
-            <= config["max_geom_distance"]
-        )
-    valid_points = valid_points[finite]
-    points = deterministic_farthest_point_sample(
-        valid_points,
+    points = fuse_and_sample_pointcloud_views(
+        valid_by_camera,
         config["num_points"],
         padding_mode=config["padding_mode"],
     )
@@ -256,5 +320,7 @@ def render_target_pointcloud(raw_env, config=None, target_geom_ids=None, return_
             points=points,
             valid_points=valid_points,
             target_geom_ids=tuple(target_geom_ids),
+            camera_names=tuple(config["camera_names"]),
+            valid_point_counts=tuple(valid_point_counts),
         )
     return points
