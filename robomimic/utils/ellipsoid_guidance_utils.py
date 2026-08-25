@@ -316,6 +316,45 @@ def reconstruct_delta_eef_poses(
     return positions, torch.stack(rotations, dim=1)
 
 
+def reconstruct_eef_poses(
+    current_eef_position,
+    current_eef_rotation,
+    positions_or_deltas,
+    rotations_or_deltas,
+    *,
+    position_mode="delta",
+):
+    """Reconstruct world EEF centers and rotations for delta or absolute actions."""
+
+    if position_mode == "delta":
+        return reconstruct_delta_eef_poses(
+            current_eef_position,
+            current_eef_rotation,
+            positions_or_deltas,
+            rotations_or_deltas,
+        )
+    if position_mode != "absolute":
+        raise ValueError("position_mode must be 'delta' or 'absolute'")
+    batch_size = positions_or_deltas.shape[0]
+    if positions_or_deltas.shape[-1] != 3 or rotations_or_deltas.shape != positions_or_deltas.shape:
+        raise ValueError("absolute positions/rotations must both have shape [B, T, 3]")
+    rotations = rotation_vector_to_matrix(rotations_or_deltas)
+    if current_eef_position is not None:
+        # Validate the provided pose but ignore it for absolute actions.
+        torch.as_tensor(
+            current_eef_position,
+            device=positions_or_deltas.device,
+            dtype=positions_or_deltas.dtype,
+        )
+    if current_eef_rotation is not None:
+        torch.as_tensor(
+            current_eef_rotation,
+            device=positions_or_deltas.device,
+            dtype=positions_or_deltas.dtype,
+        )
+    return positions_or_deltas, rotations
+
+
 def transform_local_ellipsoids(
     eef_positions,
     eef_rotations,
@@ -487,6 +526,7 @@ class EllipsoidGuidanceContext:
     position_indices: Any = (0, 1, 2)
     rotation_indices: Any = (3, 4, 5)
     action_key: str = "delta_eef_pose_action"
+    position_mode: str = "delta"
     actor_labels: Any = None
 
     def __post_init__(self):
@@ -500,6 +540,8 @@ class EllipsoidGuidanceContext:
             raise ValueError("cost_type must be 'hinge' or 'huber_hinge'")
         if self.cost_type == "huber_hinge" and self.cost_smoothing <= 0:
             raise ValueError("huber_hinge requires positive cost_smoothing")
+        if self.position_mode not in ("delta", "absolute"):
+            raise ValueError("position_mode must be 'delta' or 'absolute'")
         position_indices = tuple(int(index) for index in self.position_indices)
         rotation_indices = tuple(int(index) for index in self.rotation_indices)
         if len(position_indices) != 3 or len(set(position_indices)) != 3:
@@ -543,7 +585,10 @@ class EllipsoidGuidanceDiagnostics:
     applied_update_norm: float
 
     def to_dict(self):
-        return asdict(self)
+        data = asdict(self)
+        data["active_waypoint_count"] = data["active_actor_waypoint_count"]
+        data["tangent_side"] = 0
+        return data
 
 
 def ellipsoid_guidance_context_from_rollout_policy(
@@ -563,16 +608,44 @@ def ellipsoid_guidance_context_from_rollout_policy(
     cost_smoothing=0.01,
     enabled=True,
     actor_labels=None,
+    action_key=None,
+    position_mode=None,
 ):
-    """Build ellipsoid guidance with exact checkpoint normalization stats."""
+    """Build ellipsoid guidance with exact checkpoint normalization stats.
+
+    If ``action_key`` / ``position_mode`` are omitted, they are inferred from
+    the single configured action key: ``delta_*`` uses cumulative deltas and
+    ``abs_*`` interprets position / rotation values directly in world frame.
+    """
 
     action_keys = list(rollout_policy.policy.global_config.train.action_keys)
-    action_key = "delta_eef_pose_action"
-    if action_keys != [action_key]:
+    if len(action_keys) != 1:
         raise ValueError(
-            "Ellipsoid guidance requires only {}, got {}".format(
+            "Ellipsoid guidance requires exactly one action key, got {}".format(
+                action_keys,
+            )
+        )
+    inferred_key = action_keys[0]
+    action_key = inferred_key if action_key is None else action_key
+    if action_key not in action_keys:
+        raise ValueError(
+            "Ellipsoid guidance action key '{}' is absent from {}".format(
                 action_key,
                 action_keys,
+            )
+        )
+    if position_mode is None:
+        position_mode = (
+            "delta"
+            if inferred_key.startswith("delta")
+            else "absolute"
+            if inferred_key.startswith("abs")
+            else None
+        )
+    if position_mode is None:
+        raise ValueError(
+            "Cannot infer position_mode from action key '{}'; provide it explicitly".format(
+                inferred_key
             )
         )
     scale, offset = flatten_action_normalization_stats(
@@ -596,6 +669,7 @@ def ellipsoid_guidance_context_from_rollout_policy(
         cost_smoothing=cost_smoothing,
         enabled=enabled,
         actor_labels=actor_labels,
+        position_mode=position_mode,
     )
 
 
@@ -634,11 +708,12 @@ def ellipsoid_guidance_gradient(
     executable = raw_clean[:, start:end]
     delta_positions = executable[..., list(context.position_indices)]
     delta_rotations = executable[..., list(context.rotation_indices)]
-    eef_positions, eef_rotations = reconstruct_delta_eef_poses(
+    eef_positions, eef_rotations = reconstruct_eef_poses(
         context.current_eef_position,
         context.current_eef_rotation,
         delta_positions,
         delta_rotations,
+        position_mode=context.position_mode,
     )
     actor_centers, actor_rotations = transform_local_ellipsoids(
         eef_positions,
@@ -707,14 +782,19 @@ def ellipsoid_guided_policy_from_checkpoint(
         ckpt_dict=ckpt_dict,
     )
     source_algo = source.get("algo_name")
-    supported = {"diffusion_policy", "ellipsoid_guided_diffusion_policy"}
+    supported = {
+        "diffusion_policy": "ellipsoid_guided_diffusion_policy",
+        "ellipsoid_guided_diffusion_policy": "ellipsoid_guided_diffusion_policy",
+        "lan_o3dp": "ellipsoid_guided_lan_o3dp",
+        "ellipsoid_guided_lan_o3dp": "ellipsoid_guided_lan_o3dp",
+    }
     if source_algo not in supported:
         raise ValueError(
-            "Expected a Diffusion Policy checkpoint, got '{}'".format(source_algo)
+            "Expected a Diffusion Policy or LAN-O3DP checkpoint, got '{}'".format(source_algo)
         )
     adapted = dict(source)
     config_dict = json.loads(source["config"])
-    target_algo = "ellipsoid_guided_diffusion_policy"
+    target_algo = supported[source_algo]
     config_dict["algo_name"] = target_algo
     adapted["algo_name"] = target_algo
     adapted["config"] = json.dumps(config_dict)

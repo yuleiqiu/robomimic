@@ -14,4 +14,5 @@ from robomimic.algo.guided_diffusion_policy import GuidedDiffusionPolicyUNet, Gu
 from robomimic.algo.lan_o3dp import LanO3DPUNet
 from robomimic.algo.paper_guided_lan_o3dp import PaperGuidedLanO3DPUNet
 from robomimic.algo.point_guided_diffusion_policy import PointGuidedDiffusionPolicyUNet
+from robomimic.algo.ellipsoid_guided_lan_o3dp import EllipsoidGuidedLanO3DPUNet
 from robomimic.algo.ellipsoid_guided_diffusion_policy import EllipsoidGuidedDiffusionPolicyUNet
