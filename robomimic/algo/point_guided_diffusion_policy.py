@@ -8,6 +8,7 @@ import robomimic.utils.tensor_utils as TensorUtils
 from robomimic.algo import register_algo_factory_func
 from robomimic.algo.diffusion_policy import DiffusionPolicyUNet
 from robomimic.utils.paper_lan_guidance_utils import (
+    apply_output_tangent_guidance,
     closest_obstacle_point,
     paper_guidance_gradient,
 )
@@ -29,15 +30,23 @@ class PointGuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
         super()._create_networks()
         self.guidance_context = None
         self.guidance_diagnostics = []
+        self.guidance_tangent_side = 0
         self.last_predicted_action_chunk = None
 
     def reset(self):
         super().reset()
         self.guidance_context = None
         self.guidance_diagnostics = []
+        self.guidance_tangent_side = 0
         self.last_predicted_action_chunk = None
 
     def set_guidance_context(self, context):
+        if (
+            context is not None
+            and context.tangent_ratio > 0
+            and self.guidance_tangent_side != 0
+        ):
+            context = replace(context, tangent_side=self.guidance_tangent_side)
         self.guidance_context = context
 
     def clear_guidance_context(self):
@@ -137,5 +146,23 @@ class PointGuidedDiffusionPolicyUNet(DiffusionPolicyUNet):
 
         start = observation_horizon - 1
         action = noisy_action[:, start : start + action_horizon]
+        if context is not None and context.tangent_ratio > 0:
+            normal_guidance_active = any(
+                item.active_waypoint_count > 0
+                for item in self.guidance_diagnostics
+            )
+            with torch.no_grad():
+                action, tangent_side = apply_output_tangent_guidance(
+                    action,
+                    context,
+                    force_active=normal_guidance_active,
+                )
+            if tangent_side != 0:
+                if self.guidance_tangent_side == 0:
+                    self.guidance_tangent_side = tangent_side
+                self.guidance_diagnostics = [
+                    replace(item, tangent_side=tangent_side)
+                    for item in self.guidance_diagnostics
+                ]
         self.last_predicted_action_chunk = action.detach().cpu()
         return action

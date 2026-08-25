@@ -10,6 +10,7 @@ from robomimic.config import config_factory
 import robomimic.utils.obs_utils as ObsUtils
 from robomimic.utils.paper_lan_guidance_utils import (
     PaperLanGuidanceContext,
+    apply_output_tangent_guidance,
     closest_obstacle_point,
     paper_guidance_gradient,
     paper_obstacle_cost,
@@ -69,6 +70,185 @@ def test_thresholded_cost_negative_gradient_points_outward():
     assert gradient[0, 0, 0].item() < 0
     assert torch.all(gradient[..., 1:] == 0)
     assert (action - 0.1 * gradient)[0, 0, 0].item() > action[0, 0, 0].item()
+
+
+def test_huber_hinge_gradient_ramps_then_matches_hinge():
+    shallow = torch.tensor([[[0.045, 0.0, 0.0]]], requires_grad=True)
+    shallow_cost, _, shallow_penetration = paper_obstacle_cost(
+        shallow,
+        obstacle_point=[0.0, 0.0, 0.0],
+        safety_distance=0.05,
+        smoothing=0.01,
+        cost_type="huber_hinge",
+    )
+    shallow_gradient = torch.autograd.grad(shallow_cost, shallow)[0]
+    assert shallow_penetration.item() == pytest.approx(0.005, abs=1e-6)
+    assert shallow_cost.item() == pytest.approx(0.00125, abs=1e-6)
+    assert shallow_gradient[0, 0, 0].item() == pytest.approx(-0.5, abs=1e-5)
+
+    deep = torch.tensor([[[0.02, 0.0, 0.0]]], requires_grad=True)
+    deep_cost, _, _ = paper_obstacle_cost(
+        deep,
+        obstacle_point=[0.0, 0.0, 0.0],
+        safety_distance=0.05,
+        smoothing=0.01,
+        cost_type="huber_hinge",
+    )
+    deep_gradient = torch.autograd.grad(deep_cost, deep)[0]
+    assert deep_cost.item() == pytest.approx(0.025, abs=1e-6)
+    assert deep_gradient[0, 0, 0].item() == pytest.approx(-1.0, abs=1e-5)
+
+
+def test_huber_hinge_has_zero_gradient_at_and_outside_boundary():
+    action = torch.tensor(
+        [[[0.05, 0.0, 0.0], [0.06, 0.0, 0.0]]], requires_grad=True
+    )
+    cost, _, penetration = paper_obstacle_cost(
+        action,
+        obstacle_point=[0.0, 0.0, 0.0],
+        safety_distance=0.05,
+        smoothing=0.01,
+        cost_type="huber_hinge",
+    )
+    gradient = torch.autograd.grad(cost, action)[0]
+    assert torch.all(penetration == 0)
+    assert torch.all(gradient == 0)
+
+
+def test_output_tangent_guidance_zero_ratio_is_exact_noop():
+    action = torch.tensor(
+        [[[-0.03, -0.15, 0.40, 1.0], [-0.03, 0.10, 0.50, -1.0]]]
+    )
+    context = PaperLanGuidanceContext(
+        current_eef_pos=np.asarray([-0.03, -0.23, 0.4], dtype=np.float32),
+        obstacle_points=np.asarray([[0.0, 0.0, 0.4]], dtype=np.float32),
+        action_scale=np.ones(4),
+        action_offset=np.zeros(4),
+        guidance_scale=45.0,
+        safety_distance=1.0,
+        position_indices=(0, 1, 2),
+        tangent_ratio=0.0,
+    )
+    corrected, side = apply_output_tangent_guidance(action, context)
+    assert torch.equal(corrected, action)
+    assert side == 0
+
+
+def test_output_tangent_guidance_directly_moves_forward_aligned_xy_only():
+    action = torch.tensor(
+        [[[-0.03, -0.15, 0.40, 1.0], [-0.03, 0.10, 0.50, -1.0]]]
+    )
+    context = PaperLanGuidanceContext(
+        current_eef_pos=np.asarray([-0.03, -0.23, 0.4], dtype=np.float32),
+        obstacle_points=np.asarray([[0.0, 0.0, 0.4]], dtype=np.float32),
+        action_scale=np.ones(4),
+        action_offset=np.zeros(4),
+        guidance_scale=45.0,
+        safety_distance=1.0,
+        position_indices=(0, 1, 2),
+        tangent_ratio=0.5,
+        forward_direction_xy=(0.0, 1.0),
+    )
+    corrected, side = apply_output_tangent_guidance(action, context)
+
+    displacement = corrected - action
+    forward = action[0, -1, :2] - torch.tensor(context.current_eef_pos[:2])
+    assert side == -1
+    assert torch.dot(displacement[0, 0, :2], forward).item() > 0
+    # World -X is upward in the rotated start-left / goal-right view.
+    assert displacement[0, 0, 0].item() < 0
+    assert displacement[0, 0, 1].item() > 0
+    assert torch.all(displacement[..., 2:] == 0)
+
+
+def test_output_tangent_guidance_can_follow_normal_guidance_trigger():
+    action = torch.tensor(
+        [[[-0.20, -0.40, 0.40], [-0.20, -0.30, 0.40]]]
+    )
+    context = PaperLanGuidanceContext(
+        current_eef_pos=np.asarray([-0.02, -0.07, 0.4], dtype=np.float32),
+        obstacle_points=np.asarray([[0.0, 0.0, 0.4]], dtype=np.float32),
+        action_scale=np.ones(3),
+        action_offset=np.zeros(3),
+        guidance_scale=45.0,
+        safety_distance=0.08,
+        tangent_ratio=0.5,
+        forward_direction_xy=(0.0, 1.0),
+    )
+    unchanged, inactive_side = apply_output_tangent_guidance(action, context)
+    corrected, active_side = apply_output_tangent_guidance(
+        action, context, force_active=True
+    )
+
+    assert torch.equal(unchanged, action)
+    assert inactive_side == 0
+    assert active_side != 0
+    displacement = torch.linalg.vector_norm(
+        corrected[..., :2] - action[..., :2], dim=-1
+    )
+    torch.testing.assert_close(displacement, torch.full_like(displacement, 0.04))
+
+
+def test_output_tangent_guidance_smoothly_ramps_near_threshold():
+    action = torch.tensor(
+        [[[-0.20, -0.40, 0.40], [-0.20, -0.30, 0.40]]]
+    )
+
+    def displacement_at(distance):
+        context = PaperLanGuidanceContext(
+            current_eef_pos=np.asarray([0.0, -distance, 0.4], dtype=np.float32),
+            obstacle_points=np.asarray([[0.0, 0.0, 0.4]], dtype=np.float32),
+            action_scale=np.ones(3),
+            action_offset=np.zeros(3),
+            guidance_scale=45.0,
+            safety_distance=0.08,
+            obstacle_cost_type="huber_hinge",
+            obstacle_cost_smoothing=0.01,
+            tangent_ratio=0.1,
+            forward_direction_xy=(0.0, 1.0),
+        )
+        corrected, _ = apply_output_tangent_guidance(
+            action, context, force_active=True
+        )
+        return torch.linalg.vector_norm(
+            corrected[0, 0, :2] - action[0, 0, :2]
+        ).item()
+
+    assert displacement_at(0.091) == pytest.approx(0.0, abs=1e-7)
+    assert displacement_at(0.080) == pytest.approx(0.004, abs=1e-6)
+    assert displacement_at(0.069) == pytest.approx(0.008, abs=1e-6)
+
+
+def test_tangent_ratio_does_not_enter_denoiser_gradient():
+    noise_scheduler = scheduler(prediction_type="sample", clip_sample=False)
+    noisy = torch.tensor(
+        [[[-0.2, 0.0, 0.0], [0.2, 0.0, 0.0]]], requires_grad=True
+    )
+    common = dict(
+        current_eef_pos=np.asarray([-1.0, 0.0, 0.0], dtype=np.float32),
+        obstacle_points=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        action_scale=np.ones(3),
+        action_offset=np.zeros(3),
+        guidance_scale=1.0,
+        safety_distance=1.0,
+    )
+    baseline, _ = paper_guidance_gradient(
+        noisy_action=noisy,
+        model_output=noisy,
+        timestep=torch.tensor(5),
+        scheduler=noise_scheduler,
+        context=PaperLanGuidanceContext(**common),
+    )
+    with_tangent, diagnostics = paper_guidance_gradient(
+        noisy_action=noisy,
+        model_output=noisy,
+        timestep=torch.tensor(5),
+        scheduler=noise_scheduler,
+        context=PaperLanGuidanceContext(**common, tangent_ratio=0.5),
+    )
+    assert torch.equal(baseline, with_tangent)
+    assert diagnostics.tangent_side == 0
+    assert diagnostics.tangent_ratio == pytest.approx(0.5)
 
 
 def test_guidance_gradient_includes_denoiser_jacobian():
@@ -151,6 +331,36 @@ def test_context_validation():
             action_offset=np.zeros(7),
             guidance_scale=1.0,
             safety_distance=0.0,
+        )
+    with pytest.raises(ValueError, match="positive obstacle_cost_smoothing"):
+        PaperLanGuidanceContext(
+            current_eef_pos=np.zeros(3),
+            obstacle_points=np.zeros((1, 3)),
+            action_scale=np.ones(7),
+            action_offset=np.zeros(7),
+            guidance_scale=1.0,
+            safety_distance=0.1,
+            obstacle_cost_type="huber_hinge",
+        )
+    with pytest.raises(ValueError, match="tangent_ratio"):
+        PaperLanGuidanceContext(
+            current_eef_pos=np.zeros(3),
+            obstacle_points=np.zeros((1, 3)),
+            action_scale=np.ones(7),
+            action_offset=np.zeros(7),
+            guidance_scale=1.0,
+            safety_distance=0.1,
+            tangent_ratio=-0.1,
+        )
+    with pytest.raises(ValueError, match="tangent_side"):
+        PaperLanGuidanceContext(
+            current_eef_pos=np.zeros(3),
+            obstacle_points=np.zeros((1, 3)),
+            action_scale=np.ones(7),
+            action_offset=np.zeros(7),
+            guidance_scale=1.0,
+            safety_distance=0.1,
+            tangent_side=2,
         )
 
 
