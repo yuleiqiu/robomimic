@@ -3,11 +3,10 @@
 > Forked robomimic used by the parent project for clean-image Diffusion Policy
 > training and rollout on executable EEF-pose OSC action targets.
 
-> **Status (2026-08-07)**: the paper-aligned D2 guidance stage is archived with
-> zero collision-to-clear transitions. The active Empty2D mechanism test uses
-> standard low-dimensional Diffusion Policy plus a generic opt-in 2-D/3-D
-> predicted-clean point-trajectory guidance variant. Its data and batch-256
-> preflight gates pass; formal training is unrun.
+> **Navigation update (2026-09-07)**: use the parent AGENTS.md for research
+> status. Empty2D training/evaluation is complete, the Tabletop MVEE probe was
+> put aside, and the later wider-support test uses original point guidance.
+> No next experiment is selected. This file describes implementation contracts.
 
 ## 1. Architecture Overview
 
